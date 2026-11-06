@@ -55,10 +55,16 @@ DEFAULT_OUTPUT_MAPS = {
     "sediment": "output_sediment.exr",
 }
 
+# Gaea terrain definition (Project > Terrain Definition). Gaea maps a 0..1 height
+# value to 0..Height metres over a Width-metre wide terrain. Used when the size can't
+# be read from the .terrain file and isn't set explicitly.
+GAEA_DEFAULT_WIDTH = 5000.0
+GAEA_DEFAULT_HEIGHT = 2500.0
+
 # Node-type and parameter candidates (native + SideFX Labs variants).
 HEIGHTFIELD_OUTPUT_NODE_TYPES = ("heightfield_output", "labs::heightfield_output")
 HEIGHTFIELD_FILE_NODE_TYPES = ("heightfield_file", "labs::heightfield_file")
-OUTPUT_FILE_PARM_CANDIDATES = ("output_file", "filename", "file")
+OUTPUT_FILE_PARM_CANDIDATES = ("output", "output_file", "filename", "file")
 OUTPUT_EXECUTE_PARM_CANDIDATES = ("execute", "savetodisk", "render")
 FILE_PARM_CANDIDATES = ("file", "filename")
 
@@ -75,15 +81,16 @@ class BridgeConfig:
     input_name: str = DEFAULT_INPUT_NAME
     output_subdir: str = DEFAULT_OUTPUT_SUBDIR
     output_maps: dict = field(default_factory=lambda: dict(DEFAULT_OUTPUT_MAPS))
-    resolution: int = 2048
+    # Export resolution relative to the source HeightField: 1 = full, 2 = 1/2,
+    # 3 = 1/3, 4 = 1/4 of its voxel resolution (the world size stays the same).
+    downsample: int = 1
     # Path to the Gaea project (.terrain in Gaea 2.0). Used only to open the GUI.
     gaea_project: str = ""
     # Path to the installed Gaea executable, for the optional "open in GUI" action.
     gaea_exe: str = ""
-    # Extra parameters recorded in the manifest and folded into the cache signature
-    # (e.g. seed, duration, preset). They do not drive Gaea in manual mode; they make
-    # the cache invalidate when you change intent and document the job for Gaea setup.
-    params: dict = field(default_factory=dict)
+    # Gaea world size in metres. 0 = read it from gaea_project, else the defaults.
+    gaea_width: float = 0.0
+    gaea_height: float = 0.0
 
     # -- derived paths ----------------------------------------------------- #
 
@@ -137,9 +144,9 @@ class BridgeConfig:
 # Hashing, manifest & cache (pure logic, no hou dependency)
 # --------------------------------------------------------------------------- #
 
-def _normalise_params(params):
-    """Stable JSON text for a params dict, so the signature is order-independent."""
-    return json.dumps(params or {}, sort_keys=True, ensure_ascii=False)
+def _normalise_dict(data):
+    """Stable JSON text for a dict, so the signature is order-independent."""
+    return json.dumps(data or {}, sort_keys=True, ensure_ascii=False)
 
 
 def compute_file_hash(path, chunk_size=1 << 20):
@@ -153,17 +160,16 @@ def compute_file_hash(path, chunk_size=1 << 20):
     return digest.hexdigest()
 
 
-def compute_signature(input_path, params, resolution, output_maps):
-    """One hash over the input EXR plus the parameters that affect a rebuild.
+def compute_signature(input_path, downsample, output_maps):
+    """One hash over the input EXR plus the settings that affect a rebuild.
 
     If any of these change, the Gaea result is stale and should be rebuilt.
     """
     digest = hashlib.sha1()
     file_hash = compute_file_hash(input_path)
     digest.update((file_hash or "no-input").encode("utf-8"))
-    digest.update(_normalise_params(params).encode("utf-8"))
-    digest.update(str(resolution).encode("utf-8"))
-    digest.update(_normalise_params(dict(output_maps or {})).encode("utf-8"))
+    digest.update(str(downsample).encode("utf-8"))
+    digest.update(_normalise_dict(dict(output_maps or {})).encode("utf-8"))
     return digest.hexdigest()
 
 
@@ -179,23 +185,126 @@ def read_manifest(config):
         return None
 
 
-def write_manifest(config, signature):
-    """Persist the job manifest next to the input EXR."""
+def write_manifest(config, signature, extra=None):
+    """Persist the job manifest next to the input EXR.
+
+    ``extra`` adds informational keys (e.g. the source ``height_range``); they are
+    not part of the signature.
+    """
     import time
 
     os.makedirs(config.bridge_dir, exist_ok=True)
     manifest = {
         "signature": signature,
-        "resolution": config.resolution,
+        "downsample": config.downsample,
         "input": config.input_name,
         "output_dir": config.output_subdir,
         "output_maps": dict(config.output_maps),
-        "params": dict(config.params),
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
+    manifest.update(extra or {})
     with open(config.manifest_path, "w", encoding="utf-8") as handle:
         json.dump(manifest, handle, indent=2, ensure_ascii=False)
     return manifest
+
+
+# --------------------------------------------------------------------------- #
+# Height scale matching (pure logic, no hou dependency)
+# --------------------------------------------------------------------------- #
+
+def _find_terrain_definition(data):
+    """Depth-first search for the dict holding Gaea's terrain Width/Height."""
+    if isinstance(data, dict):
+        if {"Width", "Height", "Ratio"} <= set(data):
+            return data
+        children = data.values()
+    elif isinstance(data, list):
+        children = data
+    else:
+        return None
+    for child in children:
+        found = _find_terrain_definition(child)
+        if found is not None:
+            return found
+    return None
+
+
+def read_gaea_terrain_size(path):
+    """Return ``(width, height)`` in metres from a Gaea 2 ``.terrain`` file, or None."""
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8-sig") as handle:
+            data = json.load(handle)
+    except (ValueError, OSError):
+        return None
+    definition = _find_terrain_definition(data)
+    if definition is None:
+        return None
+    try:
+        width, height = float(definition["Width"]), float(definition["Height"])
+    except (TypeError, ValueError):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return width, height
+
+
+def gaea_world_size(config):
+    """Resolve the Gaea world size: explicit config -> .terrain file -> defaults.
+
+    Returns ``(width, height, source)`` where source is "config", "project" or
+    "default".
+    """
+    if config.gaea_width > 0 and config.gaea_height > 0:
+        return float(config.gaea_width), float(config.gaea_height), "config"
+    from_project = read_gaea_terrain_size(config.gaea_project)
+    if from_project:
+        return from_project[0], from_project[1], "project"
+    return GAEA_DEFAULT_WIDTH, GAEA_DEFAULT_HEIGHT, "default"
+
+
+def height_encoding(low, high, houdini_width, gaea_width, gaea_height):
+    """How to store Houdini heights in a 0..1 image so Gaea shows them 1:1.
+
+    Gaea displays value ``v`` as ``v * gaea_height`` metres on a ``gaea_width``-wide
+    terrain. To keep the Houdini height/width proportions, one Gaea unit (1.0) must
+    equal ``span = houdini_width * gaea_height / gaea_width`` Houdini units:
+
+        v = (h - offset) / span          (export)
+        h = v * span + offset            (import)
+
+    ``max_value`` > 1 means the relief is taller than Gaea's Height allows and will
+    be clamped unless Gaea's File node has "Allow Unclamped" on.
+    """
+    if houdini_width <= 0 or gaea_width <= 0 or gaea_height <= 0:
+        raise ValueError("Sizes must be positive")
+    span = float(houdini_width) * float(gaea_height) / float(gaea_width)
+    return {
+        "offset": float(low),
+        "span": span,
+        "max_value": (float(high) - float(low)) / span,
+    }
+
+
+def downsampled_resolution(res_x, res_y, downsample):
+    """Export image size for a HeightField of ``res_x`` x ``res_y`` voxels.
+
+    ``downsample`` 1 = full, 2 = 1/2, 3 = 1/3, 4 = 1/4 ... (rounded, at least 1 px).
+    """
+    try:
+        factor = int(downsample)
+    except (TypeError, ValueError):
+        raise ValueError("downsample must be a positive integer, got {!r}".format(
+            downsample))
+    if factor < 1:
+        raise ValueError("downsample must be >= 1, got {}".format(factor))
+    return (max(1, int(round(res_x / float(factor)))),
+            max(1, int(round(res_y / float(factor)))))
+
+
+def downsample_label(downsample):
+    return "full" if int(downsample) == 1 else "1/{}".format(int(downsample))
 
 
 def outputs_present(config):
@@ -208,16 +317,16 @@ def outputs_present(config):
 
 
 def is_cache_valid(config):
-    """True if the current input + params match the manifest and outputs exist.
+    """True if the current input + settings match the manifest and outputs exist.
 
     When this is true a fresh Gaea build is unnecessary: the maps on disk already
-    correspond to the current input and parameters.
+    correspond to the current input and settings.
     """
     manifest = read_manifest(config)
     if not manifest:
         return False
     signature = compute_signature(
-        config.input_path, config.params, config.resolution, config.output_maps
+        config.input_path, config.downsample, config.output_maps
     )
     if manifest.get("signature") != signature:
         return False
@@ -320,7 +429,60 @@ def _create_node_from_candidates(parent, type_names, node_name):
     )
 
 
-def _export_heightfield(source_node, input_path):
+def heightfield_info(source_node):
+    """Measure the source's ``height`` layer.
+
+    Returns ``{"min", "max", "width", "resolution"}``: height range, the size of the
+    largest horizontal axis in Houdini units, and the voxel resolution ``(x, y)``.
+    """
+    geometry = source_node.geometry()
+    if geometry is None:
+        raise RuntimeError("{} has no geometry".format(source_node.path()))
+    has_name = geometry.findPrimAttrib("name") is not None
+    for prim in geometry.prims():
+        if has_name and prim.attribValue("name") == "height":
+            res_x, res_y = prim.resolution()[:2]
+            voxel = prim.voxelSize()
+            width = max(res_x * voxel[0], res_y * voxel[1])
+            return {
+                "min": float(prim.volumeMin()),
+                "max": float(prim.volumeMax()),
+                "width": float(width),
+                "resolution": (int(res_x), int(res_y)),
+            }
+    raise RuntimeError(
+        "{} has no 'height' layer. Connect a HeightField.".format(source_node.path())
+    )
+
+
+def _configure_height_channels(export_node, encoding):
+    """Write the ``height`` layer as grayscale RGB, encoded for Gaea's world scale.
+
+    heightfield_output leaves the channel layers empty by default and fills them with
+    a constant 1.0 (a flat terrain in Gaea), so the layer is set explicitly. Heights
+    are remapped from ``offset..offset+span`` to 0..1 (see ``height_encoding``).
+    """
+    _set_first_available_parm(export_node, ("out_format",), "rgb")
+    low = encoding["offset"]
+    high = encoding["offset"] + encoding["span"]
+    for channel in ("red", "green", "blue"):
+        if export_node.parm(channel + "_channel") is None:
+            raise RuntimeError(
+                "{} has no '{}_channel' parameter; cannot select the height "
+                "layer.".format(export_node.path(), channel)
+            )
+        export_node.parm(channel + "_channel").set("height")
+        export_node.parm(channel + "_out_range").set("manual")
+        export_node.parmTuple(channel + "_from_range").set((low, high))
+        export_node.parmTuple(channel + "_to_range").set((0.0, 1.0))
+
+
+def _export_heightfield(source_node, input_path, encoding, image_size):
+    """Write the source ``height`` layer to ``input_path`` using ``encoding``.
+
+    ``image_size`` is ``(x, y)`` in pixels; heightfield_output resamples the layer
+    to it, so the exported terrain keeps its world size at a lower resolution.
+    """
     parent = source_node.parent()
     os.makedirs(os.path.dirname(input_path), exist_ok=True)
 
@@ -329,6 +491,10 @@ def _export_heightfield(source_node, input_path):
     )
     try:
         export_node.setInput(0, source_node)
+        _configure_height_channels(export_node, encoding)
+        _set_first_available_parm(export_node, ("specify_res",), 1)
+        _set_first_available_parm(export_node, ("resolutionx",), int(image_size[0]))
+        _set_first_available_parm(export_node, ("resolutiony",), int(image_size[1]))
         file_parm_name = None
         for name in OUTPUT_FILE_PARM_CANDIDATES:
             if export_node.parm(name) is not None:
@@ -361,47 +527,70 @@ def _export_heightfield(source_node, input_path):
         raise RuntimeError("Houdini created an empty input EXR: {}".format(input_path))
 
 
-def _get_or_create_import_node(parent, layer_name):
-    node_name = "gaea_import_{}".format(layer_name)
+def _get_or_create_node(parent, type_names, node_name):
     node = parent.node(node_name)
     if node is not None:
-        if node.type().name() not in HEIGHTFIELD_FILE_NODE_TYPES:
+        if node.type().name() not in type_names:
             raise RuntimeError(
-                "Cannot reuse {}: it is not a HeightField File node".format(node.path())
+                "Cannot reuse {}: expected a {} node".format(node.path(), type_names[0])
             )
         return node
-    return _create_node_from_candidates(parent, HEIGHTFIELD_FILE_NODE_TYPES, node_name)
+    return _create_node_from_candidates(parent, type_names, node_name)
 
 
-def _set_layer_name(node, layer_name):
-    """Best-effort: tell the HeightField File node which layer to write into."""
-    for parm_name in ("layername", "layer", "name"):
-        parm = node.parm(parm_name)
-        if parm is not None:
-            parm.set(layer_name)
-            return
+def _set_parm_if_present(node, name, value):
+    parm = node.parm(name)
+    if parm is not None:
+        parm.set(value)
 
 
-def _import_maps(parent, config):
+def _configure_import_node(node, layer_name, path, width):
+    """Load ``path`` as the height (first layer) or as a mask layer named after it."""
+    _set_first_available_parm(node, FILE_PARM_CANDIDATES, path)
+    is_height = layer_name == "height"
+    _set_parm_if_present(node, "type", "heightfield" if is_height else "mask")
+    _set_parm_if_present(node, "layer", layer_name)
+    # Defaults are "add" + clamp at 0: both would distort the imported values.
+    _set_parm_if_present(node, "layermode", "replace")
+    _set_parm_if_present(node, "doclampmin", 0)
+    _set_parm_if_present(node, "doclampmax", 0)
+    _set_parm_if_present(node, "heightscale", 1.0)
+    if width:
+        _set_parm_if_present(node, "sizemethod", "size")
+        _set_parm_if_present(node, "size", float(width))
+
+
+def _height_rescale_snippet(encoding):
+    return "// Written by houdini_gaea_bridge: Gaea 0..1 -> Houdini units.\n" \
+        "f@height = f@height * {!r} + {!r};\n".format(
+            float(encoding["span"]), float(encoding["offset"])
+        )
+
+
+def _import_maps(parent, config, encoding=None, width=None):
     """Import each available output map; chain them so one node holds all layers.
 
-    Returns ``(merged_node, imported_layers, skipped_layers)``.
+    The height layer comes first (it creates the HeightField at ``width``), the
+    rest are added as masks. With an ``encoding`` the heights are converted back to
+    Houdini units by a Volume Wrangle at the end of the chain.
+
+    Returns ``(final_node, imported_layers, skipped_layers)``.
     """
     imported = {}
     skipped = []
     previous = None
-    for layer_name in config.output_maps:
+    layers = sorted(config.output_maps, key=lambda name: name != "height")
+    for layer_name in layers:
         path = config.output_path(layer_name)
         if not os.path.isfile(path) or os.path.getsize(path) == 0:
             skipped.append(layer_name)
             continue
 
-        node = _get_or_create_import_node(parent, layer_name)
-        _set_first_available_parm(node, FILE_PARM_CANDIDATES, path)
-        _set_layer_name(node, layer_name)
-        if previous is not None:
-            node.setInput(0, previous)
-        node.cook(force=True)
+        node = _get_or_create_node(
+            parent, HEIGHTFIELD_FILE_NODE_TYPES, "gaea_import_{}".format(layer_name)
+        )
+        _configure_import_node(node, layer_name, path, width)
+        node.setInput(0, previous)
         imported[layer_name] = node
         previous = node
 
@@ -410,9 +599,16 @@ def _import_maps(parent, config):
             "No Gaea output maps were found in {}. Build the project in Gaea "
             "(F8) first, then import.".format(config.output_dir)
         )
-    if previous is not None:
-        previous.setDisplayFlag(True)
-        previous.setRenderFlag(True)
+    if encoding and "height" in imported:
+        rescale = _get_or_create_node(
+            parent, ("volumewrangle",), "gaea_import_height_rescale"
+        )
+        rescale.parm("snippet").set(_height_rescale_snippet(encoding))
+        rescale.setInput(0, previous)
+        previous = rescale
+    previous.cook(force=True)
+    previous.setDisplayFlag(True)
+    previous.setRenderFlag(True)
     return previous, imported, skipped
 
 
@@ -439,9 +635,17 @@ def export_for_gaea(source_node, config=None, use_cache=True):
     os.makedirs(config.bridge_dir, exist_ok=True)
     os.makedirs(config.output_dir, exist_ok=True)
 
-    _export_heightfield(source_node, config.input_path)
+    info = heightfield_info(source_node)
+    gaea_width, gaea_height, gaea_source = gaea_world_size(config)
+    encoding = height_encoding(
+        info["min"], info["max"], info["width"], gaea_width, gaea_height
+    )
+    image_size = downsampled_resolution(
+        info["resolution"][0], info["resolution"][1], config.downsample
+    )
+    _export_heightfield(source_node, config.input_path, encoding, image_size)
     signature = compute_signature(
-        config.input_path, config.params, config.resolution, config.output_maps
+        config.input_path, config.downsample, config.output_maps
     )
 
     if use_cache and is_cache_valid(config):
@@ -449,32 +653,75 @@ def export_for_gaea(source_node, config=None, use_cache=True):
             "input": config.input_path,
             "signature": signature,
             "cache_hit": True,
-            "message": "Cache valid: input and parameters are unchanged and Gaea "
+            "encoding": encoding,
+            "message": "Cache valid: input and settings are unchanged and Gaea "
             "outputs already exist. No rebuild needed.",
         }
 
-    write_manifest(config, signature)
+    write_manifest(config, signature, extra={
+        "height_range": [info["min"], info["max"]],
+        "houdini_width": info["width"],
+        "houdini_resolution": list(info["resolution"]),
+        "image_size": list(image_size),
+        "gaea_world": {"width": gaea_width, "height": gaea_height,
+                       "source": gaea_source},
+        "height_encoding": encoding,
+    })
+
+    notes = []
+    if info["max"] - info["min"] < 1e-6:
+        notes.append("WARNING: source terrain is flat.")
+    if encoding["max_value"] > 1.0:
+        notes.append(
+            "WARNING: relief is taller than Gaea's Height allows (peak = {:.2f}). "
+            "Raise Height in Gaea's Terrain Definition to at least {:.0f} m, or "
+            "enable 'Allow Unclamped' on the File node.".format(
+                encoding["max_value"], gaea_height * encoding["max_value"]
+            )
+        )
     return {
         "input": config.input_path,
         "signature": signature,
         "cache_hit": False,
-        "message": "Exported {} ({}px). Build the project in Gaea (F8), then "
-        "import.".format(config.input_path, config.resolution),
+        "encoding": encoding,
+        "message": "Exported {} ({}x{} px, {} of {}x{}). Houdini {:.0f} units wide, "
+        "relief {:.1f} -> Gaea {:.0f} x {:.0f} m ({}): peak at {:.3f}. Build in Gaea "
+        "(F8), then import.{}".format(
+            config.input_path, image_size[0], image_size[1],
+            downsample_label(config.downsample), info["resolution"][0],
+            info["resolution"][1], info["width"],
+            info["max"] - info["min"], gaea_width, gaea_height, gaea_source,
+            encoding["max_value"], "  " + " ".join(notes) if notes else "",
+        ),
     }
 
 
 def import_gaea_outputs(source_node, config=None):
-    """Import the Gaea output EXRs as named layers after a manual GUI build."""
+    """Import the Gaea output EXRs as named layers after a manual GUI build.
+
+    Heights are converted back to Houdini units with the encoding the last export
+    recorded in the manifest, so the terrain returns at its original scale.
+    """
     _require_node(source_node)
     config = config or BridgeConfig.load()
-    merged, imported, skipped = _import_maps(source_node.parent(), config)
+    manifest = read_manifest(config) or {}
+    encoding = manifest.get("height_encoding")
+    width = manifest.get("houdini_width")
+    merged, imported, skipped = _import_maps(
+        source_node.parent(), config, encoding=encoding, width=width
+    )
+    note = "" if encoding else (
+        "  WARNING: no height encoding in the manifest (export again); heights "
+        "left in Gaea's 0..1 range."
+    )
     return {
         "node": merged,
         "imported": imported,
         "skipped": skipped,
-        "message": "Imported layers: {}{}".format(
+        "message": "Imported layers: {}{}{}".format(
             ", ".join(imported) or "none",
             "  (skipped: {})".format(", ".join(skipped)) if skipped else "",
+            note,
         ),
     }
 
@@ -496,6 +743,46 @@ def open_in_gaea(config=None):
         args.append(config.gaea_project)
     subprocess.Popen(args)  # fire-and-forget; user drives the GUI
     return args
+
+
+# --------------------------------------------------------------------------- #
+# HDA integration
+# --------------------------------------------------------------------------- #
+
+def overrides_from_node(node):
+    """Translate the HDA's parameters into a ``BridgeConfig.load`` overrides dict.
+
+    Lives here (not in the HDA's PythonModule) so button callbacks only depend on
+    this module: fixing the logic never requires rebuilding the HDA. Works with any
+    object exposing ``parm(name)``, so it is unit-testable without Houdini.
+    """
+
+    def _eval(name, default, as_string=False):
+        parm = node.parm(name)
+        if parm is None:
+            return default
+        return parm.evalAsString() if as_string else parm.eval()
+
+    output_maps = {}
+    for layer, filename in DEFAULT_OUTPUT_MAPS.items():
+        if _eval("layer_" + layer, True):
+            output_maps[layer] = filename
+
+    downsample = _eval("downsample", "", as_string=True)
+    return {
+        "bridge_dir": _eval("bridge_dir", None, as_string=True) or None,
+        "downsample": int(downsample) if downsample else None,
+        "gaea_project": _eval("gaea_project", None, as_string=True),
+        "gaea_exe": _eval("gaea_exe", None, as_string=True),
+        "gaea_width": _eval("gaea_width", None),
+        "gaea_height": _eval("gaea_height", None),
+        "output_maps": output_maps,
+    }
+
+
+def config_from_node(node):
+    """Build a BridgeConfig for an HDA node: defaults -> JSON file -> node parms."""
+    return BridgeConfig.load(overrides=overrides_from_node(node))
 
 
 # --------------------------------------------------------------------------- #

@@ -38,29 +38,52 @@ class ConfigTests(unittest.TestCase):
 
     def test_overrides_win_and_ignore_none(self):
         cfg = ghb.BridgeConfig.load(
-            path="", overrides={"bridge_dir": "/a", "resolution": None}
+            path="", overrides={"bridge_dir": "/a", "downsample": None}
         )
         self.assertEqual(cfg.bridge_dir, "/a")
-        self.assertEqual(cfg.resolution, 2048)  # None override ignored
+        self.assertEqual(cfg.downsample, 1)  # None override ignored
 
     def test_from_dict_drops_unknown_keys(self):
-        cfg = ghb.BridgeConfig.from_dict({"bridge_dir": "/x", "bogus": 1})
+        # Also covers old configs that still carry "resolution" / "params".
+        cfg = ghb.BridgeConfig.from_dict(
+            {"bridge_dir": "/x", "bogus": 1, "resolution": 4096, "params": {}}
+        )
         self.assertEqual(cfg.bridge_dir, "/x")
 
     def test_load_from_json_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg_path = os.path.join(tmp, "c.json")
             with open(cfg_path, "w", encoding="utf-8") as handle:
-                json.dump({"bridge_dir": "/from/json", "resolution": 4096}, handle)
+                json.dump({"bridge_dir": "/from/json", "downsample": 2}, handle)
             cfg = ghb.BridgeConfig.load(path=cfg_path)
             self.assertEqual(cfg.bridge_dir, "/from/json")
-            self.assertEqual(cfg.resolution, 4096)
+            self.assertEqual(cfg.downsample, 2)
+
+
+class DownsampleTests(unittest.TestCase):
+    def test_fractions(self):
+        self.assertEqual(ghb.downsampled_resolution(500, 500, 1), (500, 500))
+        self.assertEqual(ghb.downsampled_resolution(500, 500, 2), (250, 250))
+        self.assertEqual(ghb.downsampled_resolution(500, 500, 3), (167, 167))
+        self.assertEqual(ghb.downsampled_resolution(500, 300, 4), (125, 75))
+
+    def test_never_below_one_pixel(self):
+        self.assertEqual(ghb.downsampled_resolution(2, 1, 4), (1, 1))
+
+    def test_rejects_bad_factor(self):
+        for bad in (0, -2, "x", None):
+            with self.assertRaises(ValueError):
+                ghb.downsampled_resolution(500, 500, bad)
+
+    def test_label(self):
+        self.assertEqual(ghb.downsample_label(1), "full")
+        self.assertEqual(ghb.downsample_label(3), "1/3")
 
 
 class SignatureAndCacheTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
-        self.cfg = ghb.BridgeConfig(bridge_dir=self.tmp, resolution=2048)
+        self.cfg = ghb.BridgeConfig(bridge_dir=self.tmp, downsample=1)
 
     def tearDown(self):
         import shutil
@@ -68,8 +91,7 @@ class SignatureAndCacheTests(unittest.TestCase):
 
     def _sig(self):
         return ghb.compute_signature(
-            self.cfg.input_path, self.cfg.params, self.cfg.resolution,
-            self.cfg.output_maps,
+            self.cfg.input_path, self.cfg.downsample, self.cfg.output_maps,
         )
 
     def test_signature_changes_with_input(self):
@@ -79,13 +101,13 @@ class SignatureAndCacheTests(unittest.TestCase):
         s2 = self._sig()
         self.assertNotEqual(s1, s2)
 
-    def test_signature_changes_with_params_and_resolution(self):
+    def test_signature_changes_with_downsample_and_layers(self):
         _write(self.cfg.input_path, b"aaa")
         base = self._sig()
-        self.cfg.params = {"seed": 7}
+        self.cfg.downsample = 2
         self.assertNotEqual(base, self._sig())
-        self.cfg.params = {}
-        self.cfg.resolution = 4096
+        self.cfg.downsample = 1
+        self.cfg.output_maps = {"height": "output_height.exr"}
         self.assertNotEqual(base, self._sig())
 
     def test_signature_stable_for_same_input(self):
@@ -98,7 +120,7 @@ class SignatureAndCacheTests(unittest.TestCase):
         ghb.write_manifest(self.cfg, sig)
         manifest = ghb.read_manifest(self.cfg)
         self.assertEqual(manifest["signature"], sig)
-        self.assertEqual(manifest["resolution"], 2048)
+        self.assertEqual(manifest["downsample"], 1)
         self.assertIn("height", manifest["output_maps"])
 
     def test_read_manifest_missing_and_corrupt(self):
@@ -177,6 +199,127 @@ class CleanupTests(unittest.TestCase):
     def test_is_within_helper(self):
         self.assertTrue(ghb._is_within(os.path.join(self.tmp, "a", "b"), self.tmp))
         self.assertFalse(ghb._is_within(os.path.dirname(self.tmp), self.tmp))
+
+
+class HeightScaleTests(unittest.TestCase):
+    TERRAIN = {
+        "$id": "1",
+        "Assets": {"$values": [{"Terrain": {
+            "Nodes": {"741": {"Width": 1, "Name": "not the definition"}},
+            "Width": 5000.0, "Height": 2500.0, "Ratio": 0.5,
+        }}]},
+    }
+
+    def _terrain_file(self, tmp, data):
+        path = os.path.join(tmp, "p.terrain")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+        return path
+
+    def test_reads_terrain_definition(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._terrain_file(tmp, self.TERRAIN)
+            self.assertEqual(ghb.read_gaea_terrain_size(path), (5000.0, 2500.0))
+
+    def test_unreadable_terrain_returns_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = os.path.join(tmp, "bad.terrain")
+            with open(bad, "w", encoding="utf-8") as handle:
+                handle.write("not json")
+            self.assertIsNone(ghb.read_gaea_terrain_size(bad))
+            self.assertIsNone(ghb.read_gaea_terrain_size(os.path.join(tmp, "nope")))
+            self.assertIsNone(ghb.read_gaea_terrain_size(""))
+
+    def test_world_size_precedence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._terrain_file(tmp, self.TERRAIN)
+            explicit = ghb.BridgeConfig(gaea_project=path, gaea_width=1000,
+                                        gaea_height=400)
+            self.assertEqual(ghb.gaea_world_size(explicit), (1000.0, 400.0, "config"))
+            project = ghb.BridgeConfig(gaea_project=path)
+            self.assertEqual(ghb.gaea_world_size(project), (5000.0, 2500.0, "project"))
+        default = ghb.BridgeConfig(gaea_project="")
+        self.assertEqual(
+            ghb.gaea_world_size(default),
+            (ghb.GAEA_DEFAULT_WIDTH, ghb.GAEA_DEFAULT_HEIGHT, "default"),
+        )
+
+    def test_encoding_preserves_proportions(self):
+        # 1000-unit Houdini terrain, relief -63..85, Gaea world 5000 x 2500 m.
+        enc = ghb.height_encoding(-63.0, 85.0, 1000.0, 5000.0, 2500.0)
+        self.assertAlmostEqual(enc["span"], 500.0)
+        self.assertAlmostEqual(enc["offset"], -63.0)
+        self.assertAlmostEqual(enc["max_value"], 148.0 / 500.0)
+        # Relief/width ratio in Houdini == ratio Gaea will display.
+        gaea_relief_m = enc["max_value"] * 2500.0
+        self.assertAlmostEqual(gaea_relief_m / 5000.0, 148.0 / 1000.0)
+        # Round trip: h -> v -> h.
+        v = (40.0 - enc["offset"]) / enc["span"]
+        self.assertAlmostEqual(v * enc["span"] + enc["offset"], 40.0)
+
+    def test_encoding_flags_relief_taller_than_gaea(self):
+        enc = ghb.height_encoding(0.0, 900.0, 1000.0, 5000.0, 2500.0)
+        self.assertGreater(enc["max_value"], 1.0)
+
+    def test_encoding_rejects_zero_sizes(self):
+        with self.assertRaises(ValueError):
+            ghb.height_encoding(0.0, 1.0, 0.0, 5000.0, 2500.0)
+
+
+class _FakeParm:
+    def __init__(self, value):
+        self._value = value
+
+    def eval(self):
+        return self._value
+
+    def evalAsString(self):  # noqa: N802 (mirrors the hou API)
+        return str(self._value)
+
+
+class _FakeNode:
+    """Stands in for an HDA instance: parm(name) -> parm or None."""
+
+    def __init__(self, values):
+        self._parms = {k: _FakeParm(v) for k, v in values.items()}
+
+    def parm(self, name):
+        return self._parms.get(name)
+
+
+class NodeOverridesTests(unittest.TestCase):
+    HDA_VALUES = {
+        "downsample": "3",
+        "gaea_width": 1000.0,
+        "gaea_height": 500.0,
+        "layer_height": 1,
+        "layer_erosion": 1,
+        "layer_flow": 0,
+        "layer_wear": 1,
+        "layer_sediment": 0,
+        "bridge_dir": "/bridge",
+        "gaea_project": "/p.terrain",
+        "gaea_exe": "/Gaea.exe",
+    }
+
+    def test_full_node(self):
+        cfg = ghb.BridgeConfig.load(
+            path="", overrides=ghb.overrides_from_node(_FakeNode(self.HDA_VALUES))
+        )
+        self.assertEqual(cfg.bridge_dir, "/bridge")
+        self.assertEqual(cfg.downsample, 3)
+        self.assertEqual(cfg.gaea_exe, "/Gaea.exe")
+        self.assertEqual((cfg.gaea_width, cfg.gaea_height), (1000.0, 500.0))
+        self.assertEqual(sorted(cfg.output_maps), ["erosion", "height", "wear"])
+        self.assertEqual(cfg.output_maps["height"], "output_height.exr")
+
+    def test_missing_parms_fall_back_to_defaults(self):
+        overrides = ghb.overrides_from_node(_FakeNode({}))
+        cfg = ghb.BridgeConfig.load(path="", overrides=overrides)
+        self.assertEqual(cfg.bridge_dir, ghb.DEFAULT_BRIDGE_DIR)
+        self.assertEqual(cfg.downsample, 1)
+        self.assertEqual((cfg.gaea_width, cfg.gaea_height), (0.0, 0.0))
+        self.assertEqual(cfg.output_maps, ghb.DEFAULT_OUTPUT_MAPS)
 
 
 if __name__ == "__main__":
