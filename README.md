@@ -21,11 +21,14 @@ HeightField ◀── Import ──  output/output_*.exr ◀── Export nodes 
   SOP network.
 - **Named layers.** `height`, `erosion`, `flow`, `wear` and `sediment` arrive in the
   HeightField as separate layers. Missing files are skipped with a warning, not an error.
+- **1:1 proportions.** Heights are rescaled to Gaea's world size, so the terrain looks the
+  same in both apps and returns to Houdini at its original scale.
+- **Resolution control.** Export at full, 1/2, 1/3 or 1/4 of the HeightField resolution.
 - **Hash-based cache.** The bridge computes a signature from the input, resolution and
-  parameters. If nothing has changed and the Gaea outputs already exist, it tells you no
+  layer set. If nothing has changed and the Gaea outputs already exist, it tells you no
   rebuild is needed.
-- **Job manifest.** `gh_bridge_manifest.json` records what was exported and with which
-  parameters.
+- **Job manifest.** `gh_bridge_manifest.json` records what was exported, at which
+  resolution and with which height encoding.
 - **Safe cleanup.** `cleanup_temp` never deletes files outside the bridge working folder.
 - **Hands off Gaea.** The bridge does not use the CLI build engine, SwarmHost, licensing or
   copy protection. It only (optionally) launches Gaea as a regular application, so it works
@@ -88,10 +91,15 @@ The HDA is installed into your user `otls` folder. To remove the asset, delete
 
 1. Build a terrain, for example `heightfield` ▸ `heightfield_noise`.
 2. Create a **Gaea Erosion Bridge** node and connect the HeightField to its input.
-3. On the **Paths** tab, set **Bridge Dir** (default: `C:/Temp/gh_bridge`). For the
-   **Open Project in Gaea** button, also set **Gaea Project** (`.terrain`) and **Gaea Exe**.
-4. Press **1 ▸ Export to Gaea**. `Bridge Dir` now contains `input_height.exr`,
+3. On the **Paths** tab, set **Bridge Dir** (default: `C:/Temp/gh_bridge`) and
+   **Gaea Project** (`.terrain`; the bridge reads the Gaea world size from it). For the
+   **Open Project in Gaea** button, also set **Gaea Exe**.
+4. Pick a **Resolution**: Full, 1/2, 1/3 or 1/4 of the HeightField resolution.
+5. Press **1. Export to Gaea**. `Bridge Dir` now contains `input_height.exr`,
    `gh_bridge_manifest.json` and an empty `output/` folder.
+
+   The `height` layer is written as a grayscale RGB EXR. Heights are rescaled to Gaea's
+   world size so the terrain keeps its proportions 1:1 (see [Height scale](#height-scale)).
 
 ### In Gaea: build
 
@@ -114,30 +122,50 @@ You don't have to wire up every output. Turn off the layers you don't need on th
 
 ### In Houdini: import
 
-Press **2 ▸ Import Results**. The node outputs a HeightField with the layers it found, and
-the **Status** field lists the imported and skipped layers.
+Press **2. Import Results**. The node outputs a HeightField with the layers it found, and
+the **Status** field lists the imported and skipped layers. The terrain comes back at its
+original world size and height; its resolution is that of the images Gaea exported.
 
 ### Node parameters
 
 | Parameter | What it does |
 |-----------|--------------|
-| **Gaea Preset** | Which graph you intend to build in Gaea (Erosion / Hydro / Thermal / Texturing). |
-| **Resolution** | 1k / 2k / 4k / 8k. |
-| **Seed**, **Simulation Controls** | Duration, Erosion Scale, Sedimentation, Rainfall. |
+| **Resolution** | Full / 1/2 / 1/3 / 1/4 of the input HeightField resolution. The terrain keeps its size; only the pixel count drops (a 500×500 HeightField at 1/2 exports as 250×250). |
 | **Import Layers** | Which layers to expect on import. |
 | **Paths** | Bridge working folder, Gaea project, path to `Gaea.exe`. |
+| **Gaea Terrain Size** | Gaea world width/height in metres. 0 = read from the Gaea project. |
 
-> **Note:** Gaea Preset, Seed and Simulation Controls **do not drive Gaea directly**. You
-> build and tune the graph by hand in the GUI. These values are written to the manifest as
-> a description of the job and are part of the cache hash, so changing them marks the
-> result as stale and asks you to rebuild.
+The erosion itself is set up and tuned in the Gaea GUI; the node only moves data.
+Gaea builds at the resolution in its own Terrain Definition, so lower that too if you
+want faster builds.
+
+### Height scale
+
+Gaea displays an image value `v` (0..1) as `v × Height` metres on a terrain `Width`
+metres wide (Project ▸ Terrain Definition). The bridge encodes Houdini heights so the
+height-to-width ratio is the same in both apps:
+
+```
+span = houdini_width × gaea_height / gaea_width
+v    = (h − min) / span        # export
+h    = v × span + min          # import
+```
+
+The Gaea world size is taken from, in order: the **Gaea Terrain Size** parameters on
+the node (if non-zero) → the `.terrain` file in **Gaea Project** → 5000 × 2500 m. The
+encoding is saved to the manifest (`height_encoding`), and **Import** uses it to restore
+the original heights, so the terrain returns at its Houdini scale. If the relief is
+taller than Gaea's Height allows, Status shows a warning with the minimum Height to set.
+
+Tip: erosion in Gaea depends on world size. For physically matching results, set Gaea's
+Terrain Definition width to your Houdini terrain size; the bridge adapts automatically.
 
 ### Cache
 
 On a repeated **Export**, the bridge compares the signature (hash of the input EXR,
-resolution, parameters and layer set) with the manifest. If everything matches and the
-output files are in place, Status reports that no Gaea rebuild is needed. Any change to the
-terrain or the parameters invalidates the cache.
+resolution and layer set) with the manifest. If everything matches and the output files
+are in place, Status reports that no Gaea rebuild is needed. Any change to the terrain,
+the resolution or the Gaea world size invalidates the cache.
 
 ### Without the HDA: shelf tools
 
@@ -159,15 +187,20 @@ You can set defaults without editing the code: put a `gh_bridge_config.json` fil
 ```json
 {
   "bridge_dir": "C:/Temp/gh_bridge",
-  "resolution": 4096,
+  "downsample": 2,
   "gaea_exe": "C:/Program Files/QuadSpinner/Gaea 2.0/Gaea.exe",
   "gaea_project": "D:/Projects/erosion.terrain",
+  "gaea_width": 0,
+  "gaea_height": 0,
   "output_maps": {
     "height": "output_height.exr",
     "flow": "output_flow.exr"
   }
 }
 ```
+
+`downsample` is 1 (full), 2 (1/2), 3 (1/3) or 4 (1/4). `gaea_width`/`gaea_height` of 0 mean
+"read from `gaea_project`".
 
 Precedence, from lowest to highest: defaults in the code → `gh_bridge_config.json` →
 HDA node parameters.
@@ -190,7 +223,7 @@ or with `hython` from your Houdini install if you have no standalone Python:
 & "C:\Program Files\Side Effects Software\Houdini XX.X.XXX\bin\hython.exe" tests/test_bridge_logic.py -v
 ```
 
-Expected result: `Ran 15 tests ... OK`.
+Expected result: `Ran 27 tests ... OK`.
 
 ## Limitations
 
