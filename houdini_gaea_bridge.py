@@ -29,6 +29,7 @@ import json
 import os
 import hashlib
 import subprocess
+import time
 from dataclasses import dataclass, field, asdict
 
 
@@ -49,11 +50,16 @@ CONFIG_NAME = "gh_bridge_config.json"
 # this list broad and only wire up the Export nodes you actually need in Gaea.
 DEFAULT_OUTPUT_MAPS = {
     "height": "output_height.exr",
-    "erosion": "output_erosion.exr",
     "flow": "output_flow.exr",
     "wear": "output_wear.exr",
     "sediment": "output_sediment.exr",
 }
+
+# Mask layers (everything but height) are normalized to 0..1 on import, and one of
+# them can be copied into the "mask" layer, which Houdini draws in the viewport and
+# which HeightField nodes use by default.
+DEFAULT_MASK_LAYER = "flow"
+MASK_LAYERS = ("flow", "wear", "sediment")
 
 # Gaea terrain definition (Project > Terrain Definition). Gaea maps a 0..1 height
 # value to 0..Height metres over a Width-metre wide terrain. Used when the size can't
@@ -91,6 +97,8 @@ class BridgeConfig:
     # Gaea world size in metres. 0 = read it from gaea_project, else the defaults.
     gaea_width: float = 0.0
     gaea_height: float = 0.0
+    # Imported layer to copy into the "mask" layer ("" = leave mask alone).
+    mask_layer: str = DEFAULT_MASK_LAYER
 
     # -- derived paths ----------------------------------------------------- #
 
@@ -307,13 +315,57 @@ def downsample_label(downsample):
     return "full" if int(downsample) == 1 else "1/{}".format(int(downsample))
 
 
+def find_output_file(config, layer_name):
+    """Path of the Gaea output for ``layer_name``, or None if there is none.
+
+    Tries the exact name first, then any file in the output folder whose name
+    matches ignoring case and surrounding spaces (a Gaea Export node named
+    " output_flow" writes " output_flow.exr"). Empty files don't count.
+    """
+    def usable(path):
+        return os.path.isfile(path) and os.path.getsize(path) > 0
+
+    exact = config.output_path(layer_name)
+    if usable(exact):
+        return exact
+    wanted = config.output_maps[layer_name].strip().casefold()
+    try:
+        names = sorted(os.listdir(config.output_dir))
+    except OSError:
+        return None
+    for name in names:
+        if name.strip().casefold() == wanted:
+            path = os.path.join(config.output_dir, name)
+            if usable(path):
+                return path
+    return None
+
+
 def outputs_present(config):
-    """True if every configured output map exists and is non-empty."""
-    for layer_name in config.output_maps:
-        path = config.output_path(layer_name)
-        if not os.path.isfile(path) or os.path.getsize(path) == 0:
-            return False
-    return True
+    """True if at least one configured output map exists (missing ones are skipped
+    on import, so a partial set of Gaea Export nodes is a valid result)."""
+    return any(find_output_file(config, name) for name in config.output_maps)
+
+
+def import_postprocess_snippet(encoding, mask_peaks, mask_layer):
+    """VEX for the Volume Wrangle that finishes an import.
+
+    * ``encoding``: convert ``height`` from Gaea's 0..1 back to Houdini units.
+    * ``mask_peaks``: ``{layer: max value}``; each mask is divided by its peak so it
+      spans 0..1 (Gaea writes e.g. wear as 0..0.05). Peaks <= 0 are left alone.
+    * ``mask_layer``: copy that layer into ``mask`` (shown in the viewport).
+    """
+    lines = ["// Written by houdini_gaea_bridge on import."]
+    if encoding:
+        lines.append("f@height = f@height * {!r} + {!r};".format(
+            float(encoding["span"]), float(encoding["offset"])))
+    for layer in sorted(mask_peaks):
+        peak = float(mask_peaks[layer])
+        if peak > 0:
+            lines.append("f@{0} = clamp(f@{0} / {1!r}, 0, 1);".format(layer, peak))
+    if mask_layer:
+        lines.append("f@mask = f@{};".format(mask_layer))
+    return "\n".join(lines) + "\n"
 
 
 def is_cache_valid(config):
@@ -560,29 +612,33 @@ def _configure_import_node(node, layer_name, path, width):
         _set_parm_if_present(node, "size", float(width))
 
 
-def _height_rescale_snippet(encoding):
-    return "// Written by houdini_gaea_bridge: Gaea 0..1 -> Houdini units.\n" \
-        "f@height = f@height * {!r} + {!r};\n".format(
-            float(encoding["span"]), float(encoding["offset"])
-        )
+def _layer_peaks(node, layer_names):
+    """``{layer: max value}`` of the named volume layers in ``node``'s geometry."""
+    peaks = {}
+    for prim in node.geometry().prims():
+        name = prim.attribValue("name")
+        if name in layer_names:
+            peaks[name] = float(prim.volumeMax())
+    return peaks
 
 
 def _import_maps(parent, config, encoding=None, width=None):
     """Import each available output map; chain them so one node holds all layers.
 
     The height layer comes first (it creates the HeightField at ``width``), the
-    rest are added as masks. With an ``encoding`` the heights are converted back to
-    Houdini units by a Volume Wrangle at the end of the chain.
+    rest are added as mask layers. A Volume Wrangle at the end converts heights
+    back to Houdini units (``encoding``), normalizes the masks to 0..1 and copies
+    ``config.mask_layer`` into ``mask``.
 
-    Returns ``(final_node, imported_layers, skipped_layers)``.
+    Returns ``(final_node, imported_layers, skipped_layers, mask_peaks)``.
     """
     imported = {}
     skipped = []
     previous = None
     layers = sorted(config.output_maps, key=lambda name: name != "height")
     for layer_name in layers:
-        path = config.output_path(layer_name)
-        if not os.path.isfile(path) or os.path.getsize(path) == 0:
+        path = find_output_file(config, layer_name)
+        if path is None:
             skipped.append(layer_name)
             continue
 
@@ -599,17 +655,23 @@ def _import_maps(parent, config, encoding=None, width=None):
             "No Gaea output maps were found in {}. Build the project in Gaea "
             "(F8) first, then import.".format(config.output_dir)
         )
-    if encoding and "height" in imported:
-        rescale = _get_or_create_node(
-            parent, ("volumewrangle",), "gaea_import_height_rescale"
-        )
-        rescale.parm("snippet").set(_height_rescale_snippet(encoding))
-        rescale.setInput(0, previous)
-        previous = rescale
-    previous.cook(force=True)
-    previous.setDisplayFlag(True)
-    previous.setRenderFlag(True)
-    return previous, imported, skipped
+    mask_names = [name for name in imported if name != "height"]
+    mask_peaks = _layer_peaks(previous, mask_names)
+    mask_layer = config.mask_layer if config.mask_layer in imported else ""
+
+    # Replaced by gaea_import_postprocess; drop it so it doesn't linger unwired.
+    legacy = parent.node("gaea_import_height_rescale")
+    if legacy is not None:
+        legacy.destroy()
+    post = _get_or_create_node(parent, ("volumewrangle",), "gaea_import_postprocess")
+    post.parm("snippet").set(import_postprocess_snippet(
+        encoding if "height" in imported else None, mask_peaks, mask_layer
+    ))
+    post.setInput(0, previous)
+    post.cook(force=True)
+    post.setDisplayFlag(True)
+    post.setRenderFlag(True)
+    return post, imported, skipped, mask_peaks
 
 
 # --------------------------------------------------------------------------- #
@@ -707,23 +769,35 @@ def import_gaea_outputs(source_node, config=None):
     manifest = read_manifest(config) or {}
     encoding = manifest.get("height_encoding")
     width = manifest.get("houdini_width")
-    merged, imported, skipped = _import_maps(
+    merged, imported, skipped, mask_peaks = _import_maps(
         source_node.parent(), config, encoding=encoding, width=width
-    )
-    note = "" if encoding else (
-        "  WARNING: no height encoding in the manifest (export again); heights "
-        "left in Gaea's 0..1 range."
     )
     return {
         "node": merged,
         "imported": imported,
         "skipped": skipped,
-        "message": "Imported layers: {}{}{}".format(
-            ", ".join(imported) or "none",
-            "  (skipped: {})".format(", ".join(skipped)) if skipped else "",
-            note,
+        "mask_peaks": mask_peaks,
+        "message": import_message(
+            list(imported), skipped, mask_peaks, config.mask_layer, bool(encoding)
         ),
     }
+
+
+def import_message(imported, skipped, mask_peaks, mask_layer, has_encoding):
+    """Status line for an import."""
+    parts = ["Imported layers: {}.".format(", ".join(imported) or "none")]
+    if mask_peaks:
+        parts.append("Gaea mask peaks: {}.".format(", ".join(
+            "{} {:.3g}".format(name, peak) for name, peak in sorted(mask_peaks.items())
+        )))
+    if mask_layer in imported:
+        parts.append("Mask output = {}.".format(mask_layer))
+    if skipped:
+        parts.append("Not found: {}.".format(", ".join(skipped)))
+    if "height" in imported and not has_encoding:
+        parts.append("WARNING: no height encoding in the manifest (export again); "
+                     "heights left in Gaea's 0..1 range.")
+    return "  ".join(parts)
 
 
 def open_in_gaea(config=None):
@@ -763,12 +837,10 @@ def overrides_from_node(node):
             return default
         return parm.evalAsString() if as_string else parm.eval()
 
-    output_maps = {}
-    for layer, filename in DEFAULT_OUTPUT_MAPS.items():
-        if _eval("layer_" + layer, True):
-            output_maps[layer] = filename
-
     downsample = _eval("downsample", "", as_string=True)
+    mask_layer = _eval("mask_layer", None, as_string=True)
+    if mask_layer == "none":
+        mask_layer = ""
     return {
         "bridge_dir": _eval("bridge_dir", None, as_string=True) or None,
         "downsample": int(downsample) if downsample else None,
@@ -776,13 +848,269 @@ def overrides_from_node(node):
         "gaea_exe": _eval("gaea_exe", None, as_string=True),
         "gaea_width": _eval("gaea_width", None),
         "gaea_height": _eval("gaea_height", None),
-        "output_maps": output_maps,
+        "mask_layer": mask_layer,
     }
 
 
 def config_from_node(node):
     """Build a BridgeConfig for an HDA node: defaults -> JSON file -> node parms."""
     return BridgeConfig.load(overrides=overrides_from_node(node))
+
+
+# Nodes the pre-HDA import created next to the bridge node; superseded by the
+# network inside the asset.
+LEGACY_IMPORT_NODES = (
+    "gaea_import_height", "gaea_import_erosion", "gaea_import_flow",
+    "gaea_import_wear", "gaea_import_sediment", "gaea_import_postprocess",
+    "gaea_import_height_rescale",
+)
+
+
+def _remove_legacy_import_nodes(parent):
+    removed = []
+    for name in LEGACY_IMPORT_NODES:
+        node = parent.node(name)
+        if node is not None and node.type().name() in (
+            HEIGHTFIELD_FILE_NODE_TYPES + ("volumewrangle",)
+        ):
+            node.destroy()
+            removed.append(name)
+    return removed
+
+
+def import_into_node(node, config=None, set_display=True):
+    """Import Gaea's outputs into a ``gaea_erosion_bridge`` node.
+
+    Only the node's hidden parameters change: the found file paths, the height
+    encoding from the manifest and each mask's peak. The network inside the asset
+    reads them, so all mask settings on the node stay live. Output 1 (Terrain)
+    carries the height, output 2 (Mask) the selected Gaea mask as ``mask``.
+    """
+    import hou
+
+    if node.parm("_imported") is None:
+        raise RuntimeError(
+            "{} is not an up-to-date Gaea Erosion Bridge node. Rebuild the HDA "
+            "(build_gaea_bridge_hda.py).".format(node.path())
+        )
+    config = config or config_from_node(node)
+    manifest = read_manifest(config) or {}
+    encoding = manifest.get("height_encoding") or {}
+
+    layers = ("height",) + MASK_LAYERS
+    found = {
+        layer: find_output_file(config, layer) if layer in config.output_maps else None
+        for layer in layers
+    }
+    if not any(found.values()):
+        raise RuntimeError(
+            "No Gaea output maps were found in {}. Build the project in Gaea "
+            "(F8) first, then import.".format(config.output_dir)
+        )
+    stamp = output_stamp(config)
+
+    with hou.undos.group("Gaea Erosion Bridge: import"):
+        _set_parm_if_present(node, "_import_stamp", stamp)
+        for layer in layers:
+            node.parm("_{}_file".format(layer)).set(found[layer] or "")
+        for layer in MASK_LAYERS:
+            node.parm("_{}_peak".format(layer)).set(0.0)
+        node.parm("_enc_span").set(float(encoding.get("span", 0.0)))
+        node.parm("_enc_offset").set(float(encoding.get("offset", 0.0)))
+        node.parm("_houdini_width").set(float(manifest.get("houdini_width") or 0.0))
+        node.parm("_imported").set(1)
+
+        # Same path as last time -> make the file nodes re-read the new build.
+        for layer in layers:
+            child = node.node("file_" + layer)
+            if child is not None and found[layer] and child.parm("reload") is not None:
+                child.parm("reload").pressButton()
+
+        # Peaks of the raw Gaea values drive Normalize. Read them from each file
+        # node directly, so a mask that is currently disabled still gets its peak.
+        peaks = {}
+        for layer in MASK_LAYERS:
+            child = node.node("file_" + layer)
+            if found[layer] and child is not None:
+                child.cook(force=True)
+                peaks.update(_layer_peaks(child, [layer]))
+        for layer, peak in peaks.items():
+            node.parm("_{}_peak".format(layer)).set(peak)
+
+        node.cook(force=True)
+        removed = _remove_legacy_import_nodes(node.parent())
+        if set_display:
+            node.setDisplayFlag(True)
+            node.setRenderFlag(True)
+
+    imported = [layer for layer in layers if found[layer]]
+    skipped = [layer for layer in layers if not found[layer]]
+    message = import_message(
+        imported, skipped, peaks, config.mask_layer, bool(encoding.get("span"))
+    )
+    if removed:
+        message += "  Removed old import nodes: {}.".format(", ".join(removed))
+    return {"node": node, "imported": imported, "skipped": skipped,
+            "mask_peaks": peaks, "message": message}
+
+
+def clear_node_import(node):
+    """Forget the imported files: the node passes its input through again.
+
+    Also switches Auto Import off, otherwise it would bring the files right back.
+    """
+    if node.parm("auto_import") is not None and node.parm("auto_import").eval():
+        node.parm("auto_import").set(0)
+        stop_auto_import(node)
+    node.parm("_imported").set(0)
+    _set_parm_if_present(node, "_import_stamp", "")
+    for layer in ("height",) + MASK_LAYERS:
+        node.parm("_{}_file".format(layer)).set("")
+
+
+# --------------------------------------------------------------------------- #
+# Auto Import: re-import when Gaea writes a new build
+# --------------------------------------------------------------------------- #
+
+AUTO_IMPORT_INTERVAL = 1.0  # seconds between checks of the output folder
+AUTO_IMPORT_SETTLE = 1.5    # files must be unchanged this long before importing
+AUTO_IMPORT_ERROR_BACKOFF = 5.0
+
+
+def output_stamp(config):
+    """Fingerprint of the Gaea outputs on disk: name, size and mtime of each file.
+
+    Changes whenever Gaea writes a new build. Empty string when nothing is there.
+    """
+    entries = []
+    for layer in sorted(config.output_maps):
+        path = find_output_file(config, layer)
+        if path is None:
+            continue
+        try:
+            info = os.stat(path)
+        except OSError:
+            continue
+        entries.append([layer, os.path.basename(path), info.st_size,
+                        info.st_mtime_ns // 1000000])
+    return json.dumps(entries) if entries else ""
+
+
+class SettleDetector:
+    """Decides when a new set of Gaea outputs is complete enough to import.
+
+    Gaea writes the Export files one after another, so the folder is "changed but
+    still being written" for a moment. ``update`` returns True only once the
+    fingerprint differs from the last import *and* has stayed the same for
+    ``settle`` seconds.
+    """
+
+    def __init__(self, settle=AUTO_IMPORT_SETTLE):
+        self.settle = settle
+        self._candidate = None
+        self._since = 0.0
+
+    def update(self, stamp, imported_stamp, now):
+        if not stamp or stamp == imported_stamp:
+            self._candidate = None
+            return False
+        if stamp != self._candidate:
+            self._candidate = stamp
+            self._since = now
+            return False
+        return now - self._since >= self.settle
+
+
+def _auto_import_registry():
+    """Watchers by node session id. Kept on hou.session so a module reload doesn't
+    orphan running callbacks."""
+    import hou
+
+    registry = getattr(hou.session, "_ghb_auto_import", None)
+    if registry is None:
+        registry = {}
+        hou.session._ghb_auto_import = registry
+    return registry
+
+
+def auto_import_step(node, detector, now):
+    """One check of the output folder for ``node``. Imports when a new build has
+    settled; returns the status message then, else None."""
+    import hou
+
+    config = config_from_node(node)
+    if detector.update(output_stamp(config), node.evalParm("_import_stamp"), now):
+        with hou.undos.disabler():
+            result = import_into_node(node, config, set_display=False)
+        return "Auto-imported {}.  {}".format(time.strftime("%H:%M:%S"),
+                                              result["message"])
+    return None
+
+
+def stop_auto_import(node_or_id):
+    """Stop watching for a node (or its session id). Safe to call when idle."""
+    import hou
+
+    key = node_or_id if isinstance(node_or_id, int) else node_or_id.sessionId()
+    callback = _auto_import_registry().pop(key, None)
+    if callback is not None and hou.isUIAvailable():
+        try:
+            hou.ui.removeEventLoopCallback(callback)
+        except hou.OperationFailed:
+            pass
+
+
+def start_auto_import(node):
+    """Watch the node's output folder from Houdini's UI event loop.
+
+    Returns False without a UI (hython, batch): there is no event loop to use.
+    """
+    import hou
+
+    if not hou.isUIAvailable():
+        return False
+    key = node.sessionId()
+    stop_auto_import(key)
+    detector = SettleDetector()
+    state = {"next": 0.0}
+
+    def tick():
+        now = time.monotonic()
+        if now < state["next"]:
+            return
+        state["next"] = now + AUTO_IMPORT_INTERVAL
+        target = hou.nodeBySessionId(key)
+        try:
+            if target is None or not target.evalParm("auto_import"):
+                stop_auto_import(key)
+                return
+            message = auto_import_step(target, detector, now)
+        except hou.ObjectWasDeleted:
+            stop_auto_import(key)
+            return
+        except Exception as error:  # keep watching; Gaea may still be writing
+            state["next"] = now + AUTO_IMPORT_ERROR_BACKOFF
+            message = "Auto import failed: {}".format(error)
+        if message:
+            try:
+                target.parm("_status").set(message)
+            except hou.ObjectWasDeleted:
+                stop_auto_import(key)
+                return
+            hou.ui.setStatusMessage(message)
+
+    hou.ui.addEventLoopCallback(tick)
+    _auto_import_registry()[key] = tick
+    return True
+
+
+def sync_auto_import(node):
+    """Start or stop watching to match the node's Auto Import toggle. Called by
+    the toggle and when a scene with the node is loaded."""
+    if node.parm("auto_import") is not None and node.evalParm("auto_import"):
+        return start_auto_import(node)
+    stop_auto_import(node)
+    return False
 
 
 # --------------------------------------------------------------------------- #
