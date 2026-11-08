@@ -19,8 +19,9 @@ HeightField ◀── Import ──  output/output_*.exr ◀── Export nodes 
 
 - **One-click Export / Import.** The `Gaea Erosion Bridge` HDA puts the UI right in your
   SOP network.
-- **Named layers.** `height`, `erosion`, `flow`, `wear` and `sediment` arrive in the
-  HeightField as separate layers. Missing files are skipped with a warning, not an error.
+- **Terrain and mask as separate outputs.** Output 1 is the eroded terrain; output 2 is
+  the chosen Gaea mask (`flow`, `wear` or `sediment`) as a HeightField mask, ready for the
+  Mask input of any HeightField node. Missing files are skipped, not treated as errors.
 - **1:1 proportions.** Heights are rescaled to Gaea's world size, so the terrain looks the
   same in both apps and returns to Houdini at its original scale.
 - **Resolution control.** Export at full, 1/2, 1/3 or 1/4 of the HeightField resolution.
@@ -83,7 +84,8 @@ The console prints `Installed HDA: ...\otls\gaea_erosion_bridge.hda`, and a
 **Gaea Erosion Bridge** node appears in the SOP **Tab** menu.
 
 The HDA is installed into your user `otls` folder. To remove the asset, delete
-`gaea_erosion_bridge.hda` from that folder.
+`gaea_erosion_bridge.hda` from that folder. After updating the repository, run the build
+again (and reload the module or restart Houdini); existing nodes pick up the new version.
 
 ## Usage
 
@@ -94,7 +96,8 @@ The HDA is installed into your user `otls` folder. To remove the asset, delete
 3. On the **Paths** tab, set **Bridge Dir** (default: `C:/Temp/gh_bridge`) and
    **Gaea Project** (`.terrain`; the bridge reads the Gaea world size from it). For the
    **Open Project in Gaea** button, also set **Gaea Exe**.
-4. Pick a **Resolution**: Full, 1/2, 1/3 or 1/4 of the HeightField resolution.
+4. On the **Bridge** tab, pick an **Export Resolution**: Full, 1/2, 1/3 or 1/4 of the
+   HeightField resolution.
 5. Press **1. Export to Gaea**. `Bridge Dir` now contains `input_height.exr`,
    `gh_bridge_manifest.json` and an empty `output/` folder.
 
@@ -105,35 +108,98 @@ The HDA is installed into your user `otls` folder. To remove the asset, delete
 
 1. Open the project (manually or with the **Open Project in Gaea** button).
 2. Load `input_height.exr` with a **File** node and build your erosion graph.
-3. Attach **Export** nodes to the outputs you need. Point them at `<Bridge Dir>/output/`
-   and use the file names from the table below.
-4. Press **Build (F8)**.
+3. Attach an **Export** node to each output you need. On every Export node set Format
+   **EXR**, Location **Custom**, Output Path `<Bridge Dir>/output` (a folder) and
+   If File Exists **Overwrite**, then rename the node: in Custom mode Gaea names the file
+   after the node.
+4. Save the project and press **Build (F8)**.
 
-| Houdini layer | File in `<Bridge Dir>/output/` |
-|---------------|--------------------------------|
-| `height`   | `output_height.exr` |
-| `erosion`  | `output_erosion.exr` |
-| `flow`     | `output_flow.exr` |
-| `wear`     | `output_wear.exr` |
-| `sediment` | `output_sediment.exr` |
+| Erosion2 output | Export node name | Houdini layer |
+|-----------------|------------------|---------------|
+| Out       | `output_height`   | `height`   |
+| Flow      | `output_flow`     | `flow`     |
+| Wear      | `output_wear`     | `wear`     |
+| Deposits  | `output_sediment` | `sediment` |
 
-You don't have to wire up every output. Turn off the layers you don't need on the
-**Import Layers** tab, and the bridge won't expect them.
+You don't have to wire up every output: the bridge imports whatever it finds. File names
+are matched ignoring case and leading/trailing spaces.
 
 ### In Houdini: import
 
-Press **2. Import Results**. The node outputs a HeightField with the layers it found, and
-the **Status** field lists the imported and skipped layers. The terrain comes back at its
-original world size and height; its resolution is that of the images Gaea exported.
+Press **2. Import Results**. From then on the **Gaea Erosion Bridge** node itself outputs
+the result (no extra nodes are created in your network) on two outputs:
+
+| Output | Contents |
+|--------|----------|
+| 1 · **Terrain** | The HeightField from Gaea: `height` (plus an empty `mask`), no Gaea masks. |
+| 2 · **Mask** | The mask chosen in **Mask Output**, as the `mask` layer on the same `height`. |
+
+Output 2 has the standard HeightField layout, so you can wire it into the **Mask** input
+(second input) of HeightField nodes such as Noise, Erode or Distort, or process it on its
+own (Blur, Mask by Feature…) before using it. Viewing it shows the mask in red on the
+terrain.
+
+The **Status** field lists what was found. The terrain comes back at its original world
+size and height; its resolution is that of the images Gaea exported.
+
+Import only stores the found files in the node; all settings on the **Gaea Layers** tab
+work live, without importing again. After a new Gaea build, press **2. Import Results**
+again to load it, or turn on **Auto Import** and just press F8 in Gaea. **Clear Import**
+makes the node pass its input through again.
+
+**Auto Import** checks the output folder once a second. When Gaea has written new files
+and they have stopped changing for 1.5 s (Gaea writes them one after another), the node
+imports them and reports it in Status. The node remembers what it last imported, so with
+Auto Import on it also picks up a build made while the scene was closed. It runs in the
+Houdini UI only (not in hython or batch renders) and doesn't change your display flag.
 
 ### Node parameters
 
+**Bridge tab**
+
 | Parameter | What it does |
 |-----------|--------------|
-| **Resolution** | Full / 1/2 / 1/3 / 1/4 of the input HeightField resolution. The terrain keeps its size; only the pixel count drops (a 500×500 HeightField at 1/2 exports as 250×250). |
-| **Import Layers** | Which layers to expect on import. |
-| **Paths** | Bridge working folder, Gaea project, path to `Gaea.exe`. |
-| **Gaea Terrain Size** | Gaea world width/height in metres. 0 = read from the Gaea project. |
+| **Export Resolution** | Full / 1/2 / 1/3 / 1/4 of the input HeightField resolution. The terrain keeps its size; only the pixel count drops (a 500×500 HeightField at 1/2 exports as 250×250). |
+| **1. Export to Gaea** / **2. Import Results** | The two steps of the round trip. |
+| **Open Project in Gaea** | Launches Gaea with the project from **Paths**. |
+| **Auto Import** | Import automatically when Gaea writes a new build (see above). |
+| **Clear Import** | Forget the imported files; the node passes its input through. Also turns Auto Import off. |
+
+**Gaea Layers tab**
+
+| Parameter | What it does |
+|-----------|--------------|
+| **Height** | *Gaea Result*: the eroded terrain. *Input HeightField*: keep the original height (on both outputs) and only take the mask from Gaea. |
+| **Mask Output** | Flow / Wear / Sediment: which Gaea mask goes to output 2. Only that one is loaded. |
+| **Show Mask on Terrain** | Preview: also put the selected mask into the Terrain output's `mask`, so it shows in red on the terrain. Turn it off before using the Terrain output downstream, otherwise HeightField nodes will use that mask. |
+| **Flow / Wear / Sediment** | One settings section per mask, see below. Each keeps its settings, so you can switch between masks; only the selected one is active. |
+
+Each mask section has:
+
+| Setting | Effect |
+|---------|--------|
+| **Normalize** | Divide by the layer's peak so it spans 0..1. On by default: Gaea writes some masks with tiny values (`wear` peaks around 0.05), which would look empty. The raw peaks are shown in Status. |
+| **Input Range** | Min/Max remap: values at or below Min become 0, at or above Max become 1. Raise Min to drop faint areas, lower Max to boost weak ones. |
+| **Gamma** | < 1 widens the mask, > 1 tightens it to the strongest areas. |
+| **Invert** | 1 − value. |
+| **Strength** | Final multiplier. |
+| **Blur Radius** | Smooth the final mask (scene units, 0 = off). |
+
+What the masks mean (Erosion2 outputs): **flow** is where water runs (thin channel
+networks), **wear** is where material was eroded away, **sediment** is where it was
+deposited.
+
+To use several Gaea masks at once, add another Gaea Erosion Bridge node with the same
+paths and a different **Mask Output** (pressing Import on it reads the same files).
+Converting a HeightField to polygons turns its `mask` into a point attribute.
+
+**Paths tab**
+
+| Parameter | What it does |
+|-----------|--------------|
+| **Bridge Dir** | Working folder shared with Gaea. |
+| **Gaea Project**, **Gaea Exe** | The `.terrain` file (also the source of the world size) and `Gaea.exe`. |
+| **Gaea Width / Height** | Gaea world size in metres. 0 = read from the Gaea project. |
 
 The erosion itself is set up and tuned in the Gaea GUI; the node only moves data.
 Gaea builds at the resolution in its own Terrain Definition, so lower that too if you
@@ -179,6 +245,10 @@ ghb.run_from_selection()      # export the selected HeightField node
 ghb.import_from_selection()   # import the results next to the selected node
 ```
 
+Without the HDA, import creates a small chain of `gaea_import_*` nodes next to the
+selected node (masks normalized, chosen layer copied into `mask`), without the live
+settings of the node.
+
 ## Configuration
 
 You can set defaults without editing the code: put a `gh_bridge_config.json` file next to
@@ -223,7 +293,7 @@ or with `hython` from your Houdini install if you have no standalone Python:
 & "C:\Program Files\Side Effects Software\Houdini XX.X.XXX\bin\hython.exe" tests/test_bridge_logic.py -v
 ```
 
-Expected result: `Ran 27 tests ... OK`.
+Expected result: `Ran 38 tests ... OK`.
 
 ## Limitations
 

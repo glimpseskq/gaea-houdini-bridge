@@ -144,11 +144,100 @@ class SignatureAndCacheTests(unittest.TestCase):
         self.assertFalse(ghb.is_cache_valid(self.cfg))
 
     def test_outputs_present_rejects_empty(self):
-        for layer in self.cfg.output_maps:
-            _write(self.cfg.output_path(layer), b"x")
-        self.assertTrue(ghb.outputs_present(self.cfg))
-        _write(self.cfg.output_path("height"), b"")  # empty file
+        _write(self.cfg.output_path("height"), b"")  # empty file only
         self.assertFalse(ghb.outputs_present(self.cfg))
+
+    def test_outputs_present_accepts_partial_set(self):
+        # Not every Gaea Export node has to exist.
+        _write(self.cfg.output_path("height"), b"x")
+        self.assertTrue(ghb.outputs_present(self.cfg))
+
+
+class OutputLookupTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.cfg = ghb.BridgeConfig(bridge_dir=self.tmp)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_exact_name(self):
+        _write(self.cfg.output_path("flow"))
+        self.assertEqual(ghb.find_output_file(self.cfg, "flow"),
+                         self.cfg.output_path("flow"))
+
+    def test_tolerates_spaces_and_case(self):
+        # A Gaea Export node named " Output_Sediment" writes " Output_Sediment.exr".
+        odd = os.path.join(self.cfg.output_dir, " Output_Sediment.exr")
+        _write(odd)
+        self.assertEqual(ghb.find_output_file(self.cfg, "sediment"), odd)
+
+    def test_missing_or_empty(self):
+        self.assertIsNone(ghb.find_output_file(self.cfg, "wear"))  # no folder yet
+        _write(os.path.join(self.cfg.output_dir, " output_wear.exr"), b"")
+        self.assertIsNone(ghb.find_output_file(self.cfg, "wear"))
+
+
+class AutoImportTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.cfg = ghb.BridgeConfig(bridge_dir=self.tmp)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_stamp_empty_without_outputs(self):
+        self.assertEqual(ghb.output_stamp(self.cfg), "")
+
+    def test_stamp_changes_with_new_build(self):
+        _write(self.cfg.output_path("height"), b"build1")
+        first = ghb.output_stamp(self.cfg)
+        self.assertEqual(first, ghb.output_stamp(self.cfg))  # stable
+        _write(self.cfg.output_path("height"), b"build-two")  # new size
+        self.assertNotEqual(first, ghb.output_stamp(self.cfg))
+        second = ghb.output_stamp(self.cfg)
+        _write(self.cfg.output_path("wear"), b"x")  # a new layer appears
+        self.assertNotEqual(second, ghb.output_stamp(self.cfg))
+
+    def test_detector_waits_for_files_to_settle(self):
+        det = ghb.SettleDetector(settle=1.5)
+        # Nothing new: never import.
+        self.assertFalse(det.update("A", "A", 0.0))
+        self.assertFalse(det.update("", "A", 1.0))
+        # Gaea starts writing: B, then C while still writing.
+        self.assertFalse(det.update("B", "A", 10.0))
+        self.assertFalse(det.update("C", "A", 11.0))
+        self.assertFalse(det.update("C", "A", 12.0))  # only 1 s stable
+        self.assertTrue(det.update("C", "A", 12.6))   # 1.6 s stable -> import
+
+    def test_detector_resets_after_import(self):
+        det = ghb.SettleDetector(settle=1.0)
+        det.update("B", "A", 0.0)
+        self.assertTrue(det.update("B", "A", 2.0))
+        # After the import the node's stamp is "B": nothing to do.
+        self.assertFalse(det.update("B", "B", 3.0))
+        self.assertFalse(det.update("B", "B", 10.0))
+
+
+class PostprocessSnippetTests(unittest.TestCase):
+    ENC = {"span": 500.0, "offset": -62.5, "max_value": 0.3}
+
+    def test_full_snippet(self):
+        vex = ghb.import_postprocess_snippet(
+            self.ENC, {"wear": 0.05, "flow": 1.0}, "wear"
+        )
+        self.assertIn("f@height = f@height * 500.0 + -62.5;", vex)
+        self.assertIn("f@wear = clamp(f@wear / 0.05, 0, 1);", vex)
+        self.assertIn("f@flow = clamp(f@flow / 1.0, 0, 1);", vex)
+        self.assertTrue(vex.rstrip().endswith("f@mask = f@wear;"))
+
+    def test_skips_empty_masks_and_optional_parts(self):
+        vex = ghb.import_postprocess_snippet(None, {"sediment": 0.0}, "")
+        self.assertNotIn("height", vex)
+        self.assertNotIn("sediment", vex)  # all-zero layer: nothing to normalize
+        self.assertNotIn("f@mask", vex)
 
 
 class CleanupTests(unittest.TestCase):
@@ -292,11 +381,7 @@ class NodeOverridesTests(unittest.TestCase):
         "downsample": "3",
         "gaea_width": 1000.0,
         "gaea_height": 500.0,
-        "layer_height": 1,
-        "layer_erosion": 1,
-        "layer_flow": 0,
-        "layer_wear": 1,
-        "layer_sediment": 0,
+        "mask_layer": "wear",
         "bridge_dir": "/bridge",
         "gaea_project": "/p.terrain",
         "gaea_exe": "/Gaea.exe",
@@ -310,8 +395,14 @@ class NodeOverridesTests(unittest.TestCase):
         self.assertEqual(cfg.downsample, 3)
         self.assertEqual(cfg.gaea_exe, "/Gaea.exe")
         self.assertEqual((cfg.gaea_width, cfg.gaea_height), (1000.0, 500.0))
-        self.assertEqual(sorted(cfg.output_maps), ["erosion", "height", "wear"])
-        self.assertEqual(cfg.output_maps["height"], "output_height.exr")
+        self.assertEqual(cfg.mask_layer, "wear")
+        # The node no longer filters layers: everything found is imported.
+        self.assertEqual(cfg.output_maps, ghb.DEFAULT_OUTPUT_MAPS)
+
+    def test_mask_none_means_no_viewport_mask(self):
+        overrides = ghb.overrides_from_node(_FakeNode({"mask_layer": "none"}))
+        cfg = ghb.BridgeConfig.load(path="", overrides=overrides)
+        self.assertEqual(cfg.mask_layer, "")
 
     def test_missing_parms_fall_back_to_defaults(self):
         overrides = ghb.overrides_from_node(_FakeNode({}))
@@ -319,6 +410,7 @@ class NodeOverridesTests(unittest.TestCase):
         self.assertEqual(cfg.bridge_dir, ghb.DEFAULT_BRIDGE_DIR)
         self.assertEqual(cfg.downsample, 1)
         self.assertEqual((cfg.gaea_width, cfg.gaea_height), (0.0, 0.0))
+        self.assertEqual(cfg.mask_layer, ghb.DEFAULT_MASK_LAYER)
         self.assertEqual(cfg.output_maps, ghb.DEFAULT_OUTPUT_MAPS)
 
 
