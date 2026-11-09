@@ -818,6 +818,91 @@ def _create_node_from_candidates(parent, type_names, node_name):
     )
 
 
+# --------------------------------------------------------------------------- #
+# Houdini version compatibility (19.5 and 20.x)
+# --------------------------------------------------------------------------- #
+# Known differences, checked against the SideFX docs of both versions:
+# * hou.Volume.voxelSize() exists only from Houdini 20; indexToPos() exists in both.
+# * hou.Volume.resolution() returns a hou.Vector3 of floats in 19.5, a tuple of
+#   ints in 20.x.
+# * HeightField Output's resolution toggle is "Use Resolution" in 19.5 and part of
+#   "Resolution" in 20.x.
+# Parameters are looked up from candidate names, and every export is read back
+# and checked, so an unknown difference fails loudly instead of exporting a flat
+# terrain. tools/houdini_compat_check.py reports what a given Houdini has.
+
+HFOUT_FORMAT_PARMS = ("out_format", "format")
+HFOUT_USE_RES_PARMS = ("specify_res", "use_res", "useres", "use_resolution",
+                       "douseres")
+HFOUT_CHANNEL_PARMS = {
+    "layer": ("{}_channel", "{}channel", "{}_layer"),
+    "range": ("{}_out_range", "{}_outrange", "{}_range_mode"),
+    "from": ("{}_from_range", "{}_fromrange"),
+    "to": ("{}_to_range", "{}_torange"),
+}
+
+
+def houdini_version_string():
+    try:
+        import hou
+        return hou.applicationVersionString()
+    except Exception:  # outside Houdini
+        return "unknown"
+
+
+def volume_resolution(prim):
+    """``(x, y, z)`` voxel counts as ints (19.5 returns a hou.Vector3 of floats)."""
+    return tuple(int(round(float(value))) for value in prim.resolution())
+
+
+def _distance(a, b):
+    return sum((float(b[i]) - float(a[i])) ** 2 for i in range(3)) ** 0.5
+
+
+def volume_voxel_size(prim):
+    """``(x, y)`` voxel size in world units along the volume's first two axes.
+
+    Uses voxelSize() where it exists (Houdini 20+), else the distance between
+    neighbouring voxel centres (indexToPos, available in 19.5 too), else the
+    bounding box (a HeightField spans (res - 1) voxels between voxel centres).
+    """
+    voxel_size = getattr(prim, "voxelSize", None)
+    if voxel_size is not None:
+        try:
+            size = voxel_size()
+            return float(size[0]), float(size[1])
+        except Exception:
+            pass
+    res = volume_resolution(prim)
+    try:
+        origin = prim.indexToPos((0, 0, 0))
+        size_x = _distance(origin, prim.indexToPos((1, 0, 0))) if res[0] > 1 else 0.0
+        size_y = _distance(origin, prim.indexToPos((0, 1, 0))) if res[1] > 1 else 0.0
+        if size_x > 0 or size_y > 0:
+            return (size_x or size_y), (size_y or size_x)
+    except Exception:
+        pass
+    extent = prim.boundingBox().sizevec()
+    horizontal = sorted((float(extent[0]), float(extent[1]), float(extent[2])))[1:]
+    return (horizontal[1] / max(res[0] - 1, 1), horizontal[0] / max(res[1] - 1, 1))
+
+
+def _find_parm(node, candidates, tuple_parm=False):
+    lookup = node.parmTuple if tuple_parm else node.parm
+    for name in candidates:
+        parm = lookup(name)
+        if parm is not None:
+            return parm
+    return None
+
+
+def _missing_parm_error(node, what, candidates):
+    return RuntimeError(
+        "{} has no {} parameter (tried {}) in Houdini {}. Run "
+        "tools/houdini_compat_check.py and report its output.".format(
+            node.type().name(), what, ", ".join(candidates), houdini_version_string()))
+
+
 def heightfield_info(source_node):
     """Measure the source's ``height`` layer.
 
@@ -830,11 +915,13 @@ def heightfield_info(source_node):
     has_name = geometry.findPrimAttrib("name") is not None
     for prim in geometry.prims():
         if has_name and prim.attribValue("name") == "height":
-            res_x, res_y = prim.resolution()[:2]
-            voxel = prim.voxelSize()
+            res = volume_resolution(prim)
+            res_x, res_y = res[0], res[1]
+            voxel = volume_voxel_size(prim)
             width = max(res_x * voxel[0], res_y * voxel[1])
             digest = hashlib.sha1(prim.allVoxelsAsString())
-            digest.update(repr((tuple(prim.resolution()), tuple(voxel))).encode("utf-8"))
+            digest.update(repr((res, tuple(round(v, 6) for v in voxel)))
+                          .encode("utf-8"))
             return {
                 "min": float(prim.volumeMin()),
                 "max": float(prim.volumeMax()),
@@ -854,19 +941,85 @@ def _configure_height_channels(export_node, encoding):
     a constant 1.0 (a flat terrain in Gaea), so the layer is set explicitly. Heights
     are remapped from ``offset..offset+span`` to 0..1 (see ``height_encoding``).
     """
-    _set_first_available_parm(export_node, ("out_format",), "rgb")
+    format_parm = _find_parm(export_node, HFOUT_FORMAT_PARMS)
+    if format_parm is None:
+        raise _missing_parm_error(export_node, "image Format", HFOUT_FORMAT_PARMS)
+    format_parm.set("rgb")
     low = encoding["offset"]
     high = encoding["offset"] + encoding["span"]
     for channel in ("red", "green", "blue"):
-        if export_node.parm(channel + "_channel") is None:
-            raise RuntimeError(
-                "{} has no '{}_channel' parameter; cannot select the height "
-                "layer.".format(export_node.path(), channel)
-            )
-        export_node.parm(channel + "_channel").set("height")
-        export_node.parm(channel + "_out_range").set("manual")
-        export_node.parmTuple(channel + "_from_range").set((low, high))
-        export_node.parmTuple(channel + "_to_range").set((0.0, 1.0))
+        parms = {}
+        for role, patterns in HFOUT_CHANNEL_PARMS.items():
+            names = tuple(pattern.format(channel) for pattern in patterns)
+            parm = _find_parm(export_node, names, tuple_parm=role in ("from", "to"))
+            if parm is None:
+                raise _missing_parm_error(
+                    export_node, "{} channel '{}'".format(channel, role), names)
+            parms[role] = parm
+        fill = export_node.parm("fill_{}_channel".format(channel))
+        if fill is not None:
+            fill.set(1)
+        parms["layer"].set("height")
+        parms["range"].set("manual")
+        parms["from"].set((low, high))
+        parms["to"].set((0.0, 1.0))
+
+
+def _set_export_resolution(export_node, image_size):
+    """Turn on the resolution override and set it (names differ across versions)."""
+    toggle = _find_parm(export_node, HFOUT_USE_RES_PARMS)
+    if toggle is None:
+        toggle = _find_parm_by_label(export_node, "Use Resolution")
+    if toggle is not None:
+        toggle.set(1)
+    size = _find_parm(export_node, ("resolution", "res"), tuple_parm=True)
+    if size is not None and len(size) >= 2:
+        size.set((int(image_size[0]), int(image_size[1])))
+        return
+    x_parm = _find_parm(export_node, ("resolutionx", "resx"))
+    y_parm = _find_parm(export_node, ("resolutiony", "resy"))
+    if x_parm is None or y_parm is None:
+        raise _missing_parm_error(export_node, "Resolution", ("resolution",))
+    x_parm.set(int(image_size[0]))
+    y_parm.set(int(image_size[1]))
+
+
+def _verify_export(parent, path, encoding, flat):
+    """Read the exported EXR back and check it holds the encoded terrain.
+
+    Guards against version differences that would silently write something else
+    (an unassigned channel exports a constant 1.0, i.e. a flat terrain in Gaea).
+    """
+    reader = _create_node_from_candidates(
+        parent, HEIGHTFIELD_FILE_NODE_TYPES, "gaea_bridge_export_check")
+    try:
+        _set_first_available_parm(reader, FILE_PARM_CANDIDATES, path)
+        _set_parm_if_present(reader, "type", "heightfield")
+        _set_parm_if_present(reader, "doclampmin", 0)
+        _set_parm_if_present(reader, "doclampmax", 0)
+        _set_parm_if_present(reader, "heightscale", 1.0)
+        reader.cook(force=True)
+        low = high = None
+        for prim in reader.geometry().prims():
+            if prim.attribValue("name") == "height":
+                low, high = float(prim.volumeMin()), float(prim.volumeMax())
+    finally:
+        reader.destroy()
+    if low is None:
+        raise RuntimeError("Could not read back the exported EXR {}.".format(path))
+    expected = encoding["max_value"]
+    tolerance = 0.05 * max(expected, 0.01) + 0.002
+    if flat:
+        return
+    # Downsampling smooths peaks, so only require: not constant, within 0..expected,
+    # and reaching at least half of the expected peak.
+    if (high - low < 1e-6 or low < -tolerance or high > expected + tolerance
+            or high < 0.5 * expected):
+        raise RuntimeError(
+            "The exported EXR doesn't contain the terrain: values {:.4f}..{:.4f}, "
+            "expected 0..{:.4f}. HeightField Output behaves differently in Houdini "
+            "{}; run tools/houdini_compat_check.py and report its output.".format(
+                low, high, expected, houdini_version_string()))
 
 
 def _export_heightfield(source_node, input_path, encoding, image_size):
@@ -884,9 +1037,7 @@ def _export_heightfield(source_node, input_path, encoding, image_size):
     try:
         export_node.setInput(0, source_node)
         _configure_height_channels(export_node, encoding)
-        _set_first_available_parm(export_node, ("specify_res",), 1)
-        _set_first_available_parm(export_node, ("resolutionx",), int(image_size[0]))
-        _set_first_available_parm(export_node, ("resolutiony",), int(image_size[1]))
+        _set_export_resolution(export_node, image_size)
         file_parm_name = None
         for name in OUTPUT_FILE_PARM_CANDIDATES:
             if export_node.parm(name) is not None:
@@ -917,6 +1068,8 @@ def _export_heightfield(source_node, input_path, encoding, image_size):
         raise RuntimeError("Houdini did not create the input EXR: {}".format(input_path))
     if os.path.getsize(input_path) == 0:
         raise RuntimeError("Houdini created an empty input EXR: {}".format(input_path))
+    _verify_export(parent, input_path, encoding,
+                   flat=encoding["max_value"] < 1e-9)
 
 
 def _get_or_create_node(parent, type_names, node_name):

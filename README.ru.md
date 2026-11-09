@@ -40,7 +40,8 @@ Terrain + Mask ◀─ Import ─ output/output_*.exr ◀── Export-ноды �
 
 ## Требования
 
-- Houdini с Python 3 (проверено на Houdini 20.5).
+- Houdini 19.5 или новее с Python 3 (разработано и проверено на 20.5; см.
+  [Совместимость с версиями Houdini](#совместимость-с-версиями-houdini)).
 - Gaea 2.0.
 - Windows (пути по умолчанию рассчитаны на Windows, но меняются в конфиге или на ноде).
 
@@ -51,6 +52,7 @@ Terrain + Mask ◀─ Import ─ output/output_*.exr ◀── Export-ноды �
 | `houdini_gaea_bridge.py` | Ядро: экспорт/импорт, кэш, манифест, очистка. |
 | `build_gaea_bridge_hda.py` | Однократно запускается в Houdini и собирает HDA `gaea_erosion_bridge`. |
 | `tests/test_bridge_logic.py` | Юнит-тесты логики, не требующие запущенного Houdini. |
+| `tools/houdini_compat_check.py` | Проверяет, что в версии Houdini есть всё, что использует мост. |
 
 ## Установка
 
@@ -356,6 +358,37 @@ ghb.import_from_selection()   # импорт результатов рядом �
 Приоритет (от низшего к высшему): значения в коде → `gh_bridge_config.json` →
 параметры ноды HDA.
 
+## Совместимость с версиями Houdini
+
+Мост разрабатывается на Houdini 20.5 и учитывает известные отличия 19.5:
+
+| Отличие | Houdini 19.5 | Houdini 20.x | Как мост с этим справляется |
+|---------|--------------|--------------|-----------------------------|
+| `hou.Volume.voxelSize()` | нет | есть | Размер вокселя через `indexToPos()` (есть в обеих версиях), в крайнем случае по габариту |
+| `hou.Volume.resolution()` | `hou.Vector3` из дробных | tuple из int | Приводится к int |
+| Галка разрешения в HeightField Output | «Use Resolution» | внутри «Resolution» | Ищется по нескольким именам и по подписи |
+
+Параметры нод Houdini ищутся по списку возможных имён. Каждый экспорт читается обратно и
+проверяется: если другая версия запишет что-то неожиданное (например, постоянное
+изображение, которое Gaea показывает как плоский террейн), в Status будет понятная ошибка.
+При сборке HDA выводится заметка о каждом необязательном параметре, который не нашёлся.
+
+Чтобы проверить версию Houdini, запустите в ней:
+
+```powershell
+& "C:\Program Files\Side Effects Software\Houdini XX.X.XXX\bin\hython.exe" tools/houdini_compat_check.py
+```
+
+или в Python Shell Houdini:
+
+```python
+exec(open(r"C:/path/to/BridgeHGH/tools/houdini_compat_check.py").read())
+```
+
+Скрипт перечисляет все типы нод, параметры и методы `hou.Volume`, которые использует мост,
+делает пробный экспорт и импорт маски во временной папке и убирает за собой. Если что-то
+отмечено как MISSING или FAIL, приложите отчёт к issue.
+
 ## Разработка и тесты
 
 Тесты покрывают логику, не зависящую от `hou`: конфиг и его оверрайды, построение путей,
@@ -374,7 +407,8 @@ python tests/test_bridge_logic.py -v
 & "C:\Program Files\Side Effects Software\Houdini XX.X.XXX\bin\hython.exe" tests/test_bridge_logic.py -v
 ```
 
-Ожидаемый результат: `Ran 53 tests ... OK`.
+Ожидаемый результат: `Ran 58 tests ... OK`. Тесты также имитируют `hou.Volume` из
+Houdini 19.5 и проверяют, что исходники разбираются как Python 3.7.
 
 ## Ограничения
 

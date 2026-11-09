@@ -194,22 +194,49 @@ def _show_mask_vex():
 # Internal network
 # --------------------------------------------------------------------------- #
 
+# Parameters of Houdini's own nodes are looked up from candidate names, so a
+# renamed parameter in another Houdini version is found or reported clearly.
+OPTIONAL_PARMS_MISSING = []
+
+
+def _setp(node, candidates, value, expression=False, required=True):
+    """Set (or put an HScript expression on) the first existing parameter."""
+    if isinstance(candidates, str):
+        candidates = (candidates,)
+    for name in candidates:
+        parm = node.parm(name)
+        if parm is None:
+            continue
+        if expression:
+            parm.setExpression(value, hou.exprLanguage.Hscript)
+        else:
+            parm.set(value)
+        return parm
+    message = "{} has no parameter {} in Houdini {}".format(
+        node.type().name(), " / ".join(candidates), hou.applicationVersionString())
+    if required:
+        raise RuntimeError(message + ". Run tools/houdini_compat_check.py and report "
+                           "its output.")
+    OPTIONAL_PARMS_MISSING.append(message)
+    return None
+
+
 def _file_node(parent, name, source, layer_type, layer):
     node = parent.createNode("heightfield_file", name)
     if source is not None:
         node.setInput(0, source)
-    node.parm("filename").setExpression(
-        'chs("../_{}_file")'.format(layer), hou.exprLanguage.Hscript)
-    node.parm("type").set(layer_type)
-    node.parm("layer").set(layer)
-    node.parm("layermode").set("replace")
-    node.parm("doclampmin").set(0)
-    node.parm("doclampmax").set(0)
-    node.parm("heightscale").set(1.0)
-    node.parm("sizemethod").set("size")
-    node.parm("size").setExpression(
-        'if(ch("../_houdini_width") > 0, ch("../_houdini_width"), 1000)',
-        hou.exprLanguage.Hscript)
+    _setp(node, ("filename", "file"), 'chs("../_{}_file")'.format(layer),
+          expression=True)
+    _setp(node, "type", layer_type)
+    # Mask layers must land in a layer named after them.
+    _setp(node, ("layer", "layername"), layer, required=layer_type == "mask")
+    _setp(node, "layermode", "replace", required=False)
+    _setp(node, "doclampmin", 0, required=False)
+    _setp(node, "doclampmax", 0, required=False)
+    _setp(node, "heightscale", 1.0, required=False)
+    _setp(node, "sizemethod", "size", required=False)
+    _setp(node, "size", 'if(ch("../_houdini_width") > 0, ch("../_houdini_width"), 1000)',
+          expression=True, required=False)
     return node
 
 
@@ -217,8 +244,7 @@ def _switch(parent, name, inputs, index_expr):
     node = parent.createNode("switch", name)
     for i, src in enumerate(inputs):
         node.setInput(i, src)
-    node.parm("input").setExpression(
-        "if({}, 1, 0)".format(index_expr), hou.exprLanguage.Hscript)
+    _setp(node, "input", "if({}, 1, 0)".format(index_expr), expression=True)
     return node
 
 
@@ -239,15 +265,14 @@ def _build_network(subnet):
 
     process = subnet.createNode("volumewrangle", "process_layers")
     process.setInput(0, raw)
-    process.parm("snippet").set(_process_vex())
+    _setp(process, "snippet", _process_vex())
     prev = process
 
     for layer in MASK_LAYERS:
         blur = subnet.createNode("heightfield_blur", "blur_" + layer)
         blur.setInput(0, prev)
-        blur.parm("layer").set(layer)
-        blur.parm("radius").setExpression(
-            'ch("../{}_blur")'.format(layer), hou.exprLanguage.Hscript)
+        _setp(blur, ("layer", "blurlayer"), layer)
+        _setp(blur, "radius", 'ch("../{}_blur")'.format(layer), expression=True)
         prev = _switch(subnet, "blur_" + layer + "_switch", (prev, blur),
                        'ch("../{}_blur") > 0 && {}'.format(layer, _has_layer_expr(layer)))
     processed = prev
@@ -256,10 +281,10 @@ def _build_network(subnet):
         """Copy a layer into "mask" (VEX), then drop the Gaea mask layers."""
         copy = subnet.createNode("volumewrangle", name + "_to_mask")
         copy.setInput(0, processed)
-        copy.parm("snippet").set(vex)
+        _setp(copy, "snippet", vex)
         clean = subnet.createNode("blast", name + "_only")
         clean.setInput(0, copy)
-        clean.parm("group").set(EXTRA_LAYERS_GROUP)
+        _setp(clean, "group", EXTRA_LAYERS_GROUP)
         return clean
 
     # Output 1 - Terrain: height; "mask" shows the Show Mask choice (None = the
@@ -275,7 +300,7 @@ def _build_network(subnet):
                          'ch("../_imported")')
         out = subnet.createNode("output", name)
         out.setInput(0, result)
-        out.parm("outputidx").set(index)
+        _setp(out, "outputidx", index)
         if index == 0:
             out.setDisplayFlag(True)
             out.setRenderFlag(True)
@@ -550,6 +575,7 @@ def _set_io_labels(definition, inputs, outputs):
 
 def build(install_dir=None):
     """Create, define and install the HDA. Returns the path to the .hda file."""
+    del OPTIONAL_PARMS_MISSING[:]
     obj = hou.node("/obj")
     container = obj.createNode("geo", "GHBRIDGE_TEMP_BUILD")
     try:
@@ -590,7 +616,10 @@ def build(install_dir=None):
         definition.save(hda_path, asset)
 
         hou.hda.installFile(hda_path)
-        print("Installed HDA: {}".format(hda_path))
+        print("Installed HDA: {} (Houdini {})".format(
+            hda_path, hou.applicationVersionString()))
+        for message in OPTIONAL_PARMS_MISSING:
+            print("  note: {} (optional, skipped)".format(message))
         return hda_path
     finally:
         container.destroy()
