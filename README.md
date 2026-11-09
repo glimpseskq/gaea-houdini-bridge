@@ -39,7 +39,8 @@ Terrain + Mask ◀─ Import ─ output/output_*.exr ◀── Export nodes ◀�
 
 ## Requirements
 
-- Houdini with Python 3 (tested with Houdini 20.5).
+- Houdini 19.5 or newer with Python 3 (developed and tested on 20.5; see
+  [Houdini version compatibility](#houdini-version-compatibility)).
 - Gaea 2.0.
 - Windows. The default paths assume Windows, but you can change them in the config or on
   the node.
@@ -51,6 +52,7 @@ Terrain + Mask ◀─ Import ─ output/output_*.exr ◀── Export nodes ◀�
 | `houdini_gaea_bridge.py` | Core module: export/import, cache, manifest, cleanup. |
 | `build_gaea_bridge_hda.py` | Run once inside Houdini to build the `gaea_erosion_bridge` HDA. |
 | `tests/test_bridge_logic.py` | Unit tests for the logic; they do not need a running Houdini. |
+| `tools/houdini_compat_check.py` | Checks that a Houdini version has everything the bridge uses. |
 
 ## Installation
 
@@ -359,6 +361,38 @@ You can set defaults without editing the code: put a `gh_bridge_config.json` fil
 Precedence, from lowest to highest: defaults in the code → `gh_bridge_config.json` →
 HDA node parameters.
 
+## Houdini version compatibility
+
+The bridge is developed on Houdini 20.5 and handles the known differences of 19.5:
+
+| Difference | Houdini 19.5 | Houdini 20.x | How the bridge handles it |
+|------------|--------------|--------------|---------------------------|
+| `hou.Volume.voxelSize()` | missing | present | Voxel size from `indexToPos()` (both versions), bounding box as a last resort |
+| `hou.Volume.resolution()` | `hou.Vector3` of floats | tuple of ints | Converted to ints |
+| HeightField Output resolution toggle | "Use Resolution" | inside "Resolution" | Found by several names and by label |
+
+Parameters of Houdini's own nodes are looked up from a list of candidate names. Every
+export is read back and checked, so if another version writes something unexpected
+(for example a constant image, which Gaea shows as a flat terrain), Status shows a clear
+error instead. Building the HDA prints a note for every optional parameter it couldn't
+find.
+
+To check a Houdini version, run in it:
+
+```powershell
+& "C:\Program Files\Side Effects Software\Houdini XX.X.XXX\bin\hython.exe" tools/houdini_compat_check.py
+```
+
+or, from Houdini's Python Shell:
+
+```python
+exec(open(r"C:/path/to/BridgeHGH/tools/houdini_compat_check.py").read())
+```
+
+It lists every node type, parameter and `hou.Volume` method the bridge uses, runs a test
+export and mask import in a temporary folder, and cleans up after itself. If anything
+shows as MISSING or FAIL, include the report in an issue.
+
 ## Development and tests
 
 The tests cover the logic that does not depend on `hou`: config and overrides, path
@@ -378,7 +412,8 @@ or with `hython` from your Houdini install if you have no standalone Python:
 & "C:\Program Files\Side Effects Software\Houdini XX.X.XXX\bin\hython.exe" tests/test_bridge_logic.py -v
 ```
 
-Expected result: `Ran 53 tests ... OK`.
+Expected result: `Ran 58 tests ... OK`. The tests also simulate Houdini 19.5's
+`hou.Volume` and check that the sources parse as Python 3.7.
 
 ## Limitations
 

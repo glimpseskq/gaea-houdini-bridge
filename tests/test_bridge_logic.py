@@ -403,6 +403,86 @@ class ErosionTemplateTests(unittest.TestCase):
         self.assertEqual(cmd[2], "C:/b/gaea_template_build.terrain")
 
 
+class _Vector3:
+    """Like hou.Vector3 in 19.5: indexable and iterable floats, no slicing."""
+
+    def __init__(self, *values):
+        self._v = [float(v) for v in values]
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            raise TypeError("hou.Vector3 does not support slicing")
+        return self._v[index]
+
+    def __iter__(self):
+        return iter(self._v)
+
+    def __len__(self):
+        return 3
+
+
+class _BBox:
+    def __init__(self, size):
+        self._size = size
+
+    def sizevec(self):
+        return _Vector3(*self._size)
+
+
+class _Volume195:
+    """A 500x500 HeightField with 2-unit voxels as Houdini 19.5 exposes it:
+    resolution() is a Vector3 of floats and there is no voxelSize()."""
+
+    def __init__(self, index_to_pos=True):
+        self._index_to_pos = index_to_pos
+
+    def resolution(self):
+        return _Vector3(500, 500, 1)
+
+    def indexToPos(self, index):
+        if not self._index_to_pos:
+            raise AttributeError("indexToPos")
+        x, y, _ = index
+        return _Vector3(-499 + 2 * x, 0, -499 + 2 * y)  # HF lies in XZ
+
+    def boundingBox(self):
+        return _BBox((998.0, 150.0, 998.0))  # centre to centre: (res - 1) * voxel
+
+
+class _Volume20(_Volume195):
+    def resolution(self):
+        return (500, 500, 1)
+
+    def voxelSize(self):
+        return _Vector3(2, 2, 2)
+
+
+class HoudiniVersionCompatTests(unittest.TestCase):
+    def test_resolution_is_ints_on_both_versions(self):
+        self.assertEqual(ghb.volume_resolution(_Volume195()), (500, 500, 1))
+        self.assertEqual(ghb.volume_resolution(_Volume20()), (500, 500, 1))
+
+    def test_voxel_size_houdini20(self):
+        self.assertEqual(ghb.volume_voxel_size(_Volume20()), (2.0, 2.0))
+
+    def test_voxel_size_houdini195_from_index_to_pos(self):
+        self.assertEqual(ghb.volume_voxel_size(_Volume195()), (2.0, 2.0))
+
+    def test_voxel_size_bbox_fallback(self):
+        size = ghb.volume_voxel_size(_Volume195(index_to_pos=False))
+        self.assertAlmostEqual(size[0], 2.0)
+        self.assertAlmostEqual(size[1], 2.0)
+
+    def test_sources_parse_as_python_37(self):
+        # Houdini 19.5 ships Python 3.9 (3.7 builds exist): no newer syntax.
+        import ast
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        for name in ("houdini_gaea_bridge.py", "build_gaea_bridge_hda.py",
+                     os.path.join("tools", "houdini_compat_check.py")):
+            with open(os.path.join(root, name), encoding="utf-8") as handle:
+                ast.parse(handle.read(), filename=name, feature_version=(3, 7))
+
+
 class PostprocessSnippetTests(unittest.TestCase):
     ENC = {"span": 500.0, "offset": -62.5, "max_value": 0.3}
 
