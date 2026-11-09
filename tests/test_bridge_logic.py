@@ -110,6 +110,18 @@ class SignatureAndCacheTests(unittest.TestCase):
         self.cfg.output_maps = {"height": "output_height.exr"}
         self.assertNotEqual(base, self._sig())
 
+    def test_content_hash_ignores_file_bytes(self):
+        # The exported EXR embeds a timestamp, so the export identifies the input
+        # by a hash of the heights instead of the file's bytes.
+        _write(self.cfg.input_path, b"export 1")
+        sig = lambda: ghb.compute_signature(  # noqa: E731
+            self.cfg.input_path, 1, self.cfg.output_maps, content_hash="heights-A")
+        first = sig()
+        _write(self.cfg.input_path, b"export 2, same heights")
+        self.assertEqual(first, sig())
+        self.assertNotEqual(first, ghb.compute_signature(
+            self.cfg.input_path, 1, self.cfg.output_maps, content_hash="heights-B"))
+
     def test_signature_stable_for_same_input(self):
         _write(self.cfg.input_path, b"aaa")
         self.assertEqual(self._sig(), self._sig())
@@ -219,6 +231,176 @@ class AutoImportTests(unittest.TestCase):
         # After the import the node's stamp is "B": nothing to do.
         self.assertFalse(det.update("B", "B", 3.0))
         self.assertFalse(det.update("B", "B", 10.0))
+
+
+class SwarmTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.cfg = ghb.BridgeConfig(
+            bridge_dir=os.path.join(self.tmp, "bridge"),
+            gaea_exe=os.path.join(self.tmp, "Gaea", "Gaea.exe"),
+            gaea_project=os.path.join(self.tmp, "p.terrain"),
+        )
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _project(self, file_name=None, out_dir=None, export_format=None,
+                 export_name="output_height"):
+        export = {"$type": "QuadSpinner.Gaea.Nodes.Export, Gaea.Nodes",
+                  "Name": export_name, "Location": "Custom",
+                  "OutputPath": out_dir or self.cfg.output_dir}
+        if export_format:
+            export["Format"] = export_format
+        data = {"Assets": {"$values": [{"Terrain": {"Nodes": {
+            "1": {"$type": "QuadSpinner.Gaea.Nodes.File, Gaea.Nodes",
+                  "Name": "File", "FileName": file_name or self.cfg.input_path},
+            "2": export,
+        }}}]}}
+        with open(self.cfg.gaea_project, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+
+    def test_swarm_next_to_gaea_or_explicit(self):
+        self.assertEqual(ghb.swarm_exe_path(self.cfg),
+                         os.path.join(self.tmp, "Gaea", "Gaea.Swarm.exe"))
+        self.cfg.gaea_swarm = "/custom/Gaea.Swarm.exe"
+        self.assertEqual(ghb.swarm_exe_path(self.cfg), "/custom/Gaea.Swarm.exe")
+
+    def test_command(self):
+        cmd = ghb.swarm_command(self.cfg)
+        self.assertEqual(cmd[1:], ["--Filename", self.cfg.gaea_project, "--silent"])
+        self.cfg.build_resolution = 1024
+        self.cfg.ignore_cache = True
+        cmd = ghb.swarm_command(self.cfg)
+        self.assertIn("--ignorecache", cmd)
+        self.assertEqual(cmd[cmd.index("--resolution") + 1], "1024")
+
+    def test_project_paths_ok(self):
+        # Slashes/case differ from the bridge paths but point to the same place.
+        self._project(file_name=self.cfg.input_path.replace("\\", "/"),
+                      export_name=" Output_Height")
+        self.assertEqual(ghb.check_project_paths(self.cfg), [])
+
+    def test_project_paths_problems(self):
+        self._project(file_name="D:/elsewhere/in.exr", out_dir="D:/elsewhere",
+                      export_format="GaeaRaw")
+        problems = " ".join(ghb.check_project_paths(self.cfg))
+        self.assertIn("No File node", problems)
+        self.assertIn("Output Path", problems)
+        self.assertIn("Format EXR", problems)
+
+    def test_project_without_height_export(self):
+        self._project(export_name="something_else")
+        self.assertIn("output_height", " ".join(ghb.check_project_paths(self.cfg)))
+
+    def test_missing_project_and_swarm_block_the_build(self):
+        problems = " ".join(ghb.validate_build(self.cfg))
+        self.assertIn("Gaea.Swarm.exe not found", problems)
+        self.assertIn("Export first", problems)
+        self.assertIn("project not found", problems)
+
+    def test_success_judged_by_written_files(self):
+        out = self.cfg.output_path("height")
+        os.makedirs(os.path.dirname(out))
+        script = "open(r'{}', 'wb').write(b'built')".format(out)
+        job = ghb.SwarmBuild(self.cfg, command=[sys.executable, "-c", script]).start()
+        self.assertEqual(job.wait(timeout=60), 0)
+        ok, message = job.result_message()
+        self.assertTrue(ok, message)
+        self.assertEqual(job.updated_layers(), ["height"])
+
+    def test_exit_code_zero_but_nothing_written_is_a_failure(self):
+        # Gaea.Swarm.exe returns 0 even for a missing project.
+        job = ghb.SwarmBuild(self.cfg, command=[sys.executable, "-c", "pass"]).start()
+        job.wait(timeout=60)
+        ok, message = job.result_message()
+        self.assertFalse(ok)
+        self.assertIn("without writing new files", message)
+
+
+class ErosionTemplateTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.cfg = ghb.BridgeConfig(bridge_dir=os.path.join(self.tmp, "bridge"),
+                                    gaea_project=os.path.join(self.tmp, "t.terrain"))
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _template(self, *erosion_nodes):
+        nodes = {str(i): dict({"$type": "QuadSpinner.Gaea.Nodes.Erosion2, Gaea.Nodes",
+                               "Name": "Erosion2"}, **extra)
+                 for i, extra in enumerate(erosion_nodes)}
+        nodes["99"] = {"$type": "QuadSpinner.Gaea.Nodes.Export, Gaea.Nodes",
+                       "Name": "output_height", "Mystery": 7}
+        with open(self.cfg.gaea_project, "w", encoding="utf-8") as handle:
+            json.dump({"Assets": {"$values": [{"Terrain": {"Nodes": nodes}}]}}, handle)
+
+    def _copy(self):
+        dst = ghb.template_build_path(self.cfg)
+        changed = ghb.write_template_copy(self.cfg, dst)
+        with open(dst, encoding="utf-8") as handle:
+            data = json.load(handle)
+        return changed, ghb.find_erosion_node(data, self.cfg.erosion_node), data
+
+    def test_spec_is_complete_and_sane(self):
+        names = [spec[0] for spec in ghb.EROSION2_PARAMS]
+        self.assertEqual(len(names), len(set(names)))
+        self.assertEqual(len(names), 20)  # Slope/Altitude (Float2) are skipped
+        for name, _, _, kind, default, low, high in ghb.EROSION2_PARAMS:
+            if kind != "bool":
+                self.assertTrue(low <= default <= high, name)
+
+    def test_read_fills_gaea_defaults(self):
+        self._template({"ErosionScale": 289.51, "Downcutting": 0.55, "Seed": 13864})
+        values = ghb.read_erosion_params(self.cfg.gaea_project)
+        self.assertAlmostEqual(values["ErosionScale"], 289.51)
+        self.assertEqual(values["Seed"], 13864)
+        self.assertEqual(values["Duration"], 10.0)        # not saved -> default
+        self.assertIs(values["Enable"], False)
+
+    def test_copy_writes_only_changed_values(self):
+        self._template({"ErosionScale": 289.51, "Seed": 13864})
+        self.cfg.erosion_params = dict(ghb.read_erosion_params(self.cfg.gaea_project))
+        self.cfg.erosion_params.update(Duration=40.0, Enable=True, RainShadow=0.5)
+        self.cfg.erosion_params["Bogus"] = 1  # unknown parameters are skipped
+        changed, node, data = self._copy()
+        self.assertEqual(changed, ["Duration", "Enable", "RainShadow"])
+        self.assertEqual(node["Duration"], 40.0)
+        self.assertIs(node["Enable"], True)
+        self.assertEqual(node["Seed"], 13864)
+        self.assertNotIn("Bogus", node)
+        self.assertNotIn("Shape", node)  # untouched defaults stay unwritten
+        # The rest of the project survives, and the original is unchanged.
+        self.assertIn('"Mystery": 7', json.dumps(data))
+        self.assertEqual(ghb.read_erosion_params(self.cfg.gaea_project)["Duration"], 10.0)
+
+    def test_several_erosion_nodes_need_a_name(self):
+        self._template({"Name": "Erosion2"}, {"Name": "Final", "Duration": 30.0})
+        with self.assertRaises(ValueError):
+            ghb.read_erosion_params(self.cfg.gaea_project)
+        self.assertEqual(ghb.read_erosion_params(self.cfg.gaea_project, "Final")
+                         ["Duration"], 30.0)
+        with self.assertRaises(ValueError):
+            ghb.read_erosion_params(self.cfg.gaea_project, "Missing")
+
+    def test_build_settings_drive_the_cache(self):
+        self._template({})
+        base = ghb.build_settings(self.cfg)
+        self.cfg.use_template = True
+        self.cfg.erosion_params = {"Duration": 10.0}
+        with_template = ghb.build_settings(self.cfg)
+        self.assertNotEqual(base, with_template)
+        self.cfg.erosion_params = {"Duration": 20.0}
+        self.assertNotEqual(with_template, ghb.build_settings(self.cfg))
+        self.cfg.build_resolution = 512
+        self.assertEqual(ghb.build_settings(self.cfg)["build_resolution"], 512)
+
+    def test_swarm_builds_the_copy(self):
+        cmd = ghb.swarm_command(self.cfg, project="C:/b/gaea_template_build.terrain")
+        self.assertEqual(cmd[2], "C:/b/gaea_template_build.terrain")
 
 
 class PostprocessSnippetTests(unittest.TestCase):
