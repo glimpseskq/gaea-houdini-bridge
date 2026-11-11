@@ -366,8 +366,10 @@ class ErosionTemplateTests(unittest.TestCase):
         self.cfg.erosion_params = dict(ghb.read_erosion_params(self.cfg.gaea_project))
         self.cfg.erosion_params.update(Duration=40.0, Enable=True, RainShadow=0.5)
         self.cfg.erosion_params["Bogus"] = 1  # unknown parameters are skipped
+        self.cfg.use_template = True
         changed, node, data = self._copy()
-        self.assertEqual(changed, ["Duration", "Enable", "RainShadow"])
+        # The test template's Export has no Custom path: the copy fixes it too.
+        self.assertEqual(changed, ["Duration", "Enable", "RainShadow", "export paths"])
         self.assertEqual(node["Duration"], 40.0)
         self.assertIs(node["Enable"], True)
         self.assertEqual(node["Seed"], 13864)
@@ -481,6 +483,170 @@ class HoudiniVersionCompatTests(unittest.TestCase):
                      os.path.join("tools", "houdini_compat_check.py")):
             with open(os.path.join(root, name), encoding="utf-8") as handle:
                 ast.parse(handle.read(), filename=name, feature_version=(3, 7))
+
+
+class TintTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.cfg = ghb.BridgeConfig(bridge_dir=os.path.join(self.tmp, "b"),
+                                    gaea_project=os.path.join(self.tmp, "p.terrain"))
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _project(self, tint=None, tint_export=None):
+        nodes = {
+            "1": {"$type": "QuadSpinner.Gaea.Nodes.File, Gaea.Nodes", "Id": 1,
+                  "FileName": self.cfg.input_path},
+            "2": {"$type": "QuadSpinner.Gaea.Nodes.Export, Gaea.Nodes",
+                  "Name": "output_height", "Location": "Custom",
+                  "OutputPath": self.cfg.output_dir},
+            "3": dict({"$type": "QuadSpinner.Gaea.Nodes.Tint, Gaea.Nodes",
+                       "Name": "Tint"}, **(tint or {})),
+            "4": dict({"$type": "QuadSpinner.Gaea.Nodes.Export, Gaea.Nodes",
+                       "Name": " output_tint"}, **(tint_export or {})),
+        }
+        with open(self.cfg.gaea_project, "w", encoding="utf-8") as handle:
+            json.dump({"Assets": {"$values": [{"Terrain": {"Nodes": nodes}}]}}, handle)
+
+    def test_spec(self):
+        self.assertEqual([s[0] for s in ghb.TINT_PARAMS],
+                         ["Start", "End", "Hue", "Saturation", "Lightness",
+                          "Enhance", "Reverse"])
+
+    def test_read_defaults_and_stored_colors(self):
+        self._project({"Start": {"R": 0.2, "G": 0.1, "B": 0.0}, "Hue": 0.5})
+        values = ghb.read_tint_params(self.cfg.gaea_project)
+        self.assertEqual(values["Start"], (0.2, 0.1, 0.0))
+        self.assertEqual(values["End"], (1.0, 1.0, 1.0))  # Gaea default
+        self.assertEqual(values["Enhance"], "Autolevel")
+        self.assertEqual(values["Hue"], 0.5)
+
+    def test_copy_writes_tint_values_and_fixes_tint_export(self):
+        self._project()
+        self.cfg.use_tint = True
+        self.cfg.tint_params = dict(ghb.read_tint_params(self.cfg.gaea_project))
+        self.cfg.tint_params.update(Start=(1.0, 0.0, 0.0), Enhance="Equalize",
+                                    Reverse=True)
+        dst = os.path.join(self.tmp, "copy.terrain")
+        changed = ghb.write_template_copy(self.cfg, dst)
+        self.assertEqual(changed, ["Tint Enhance", "Tint Reverse", "Tint Start",
+                                   "export paths"])
+        with open(dst, encoding="utf-8") as handle:
+            nodes = json.load(handle)["Assets"]["$values"][0]["Terrain"]["Nodes"]
+        self.assertEqual(nodes["3"]["Start"], {"R": 1.0, "G": 0.0, "B": 0.0})
+        self.assertEqual(nodes["3"]["Enhance"], "Equalize")
+        self.assertNotIn("End", nodes["3"])  # unchanged -> not written
+        self.assertEqual(nodes["4"]["Location"], "Custom")
+        self.assertTrue(ghb._same_path(nodes["4"]["OutputPath"], self.cfg.output_dir))
+
+    def test_bad_enum_is_skipped(self):
+        self._project()
+        self.cfg.use_tint = True
+        self.cfg.tint_params = {"Enhance": "Sharpen"}
+        self.assertNotIn("Tint Enhance",
+                         ghb.write_template_copy(self.cfg, os.path.join(self.tmp, "c")))
+
+    def test_tint_export_checked_in_plain_builds(self):
+        self._project()  # tint export writes to the build folder
+        problems = " ".join(ghb.check_project_paths(self.cfg))
+        self.assertIn("output_tint", problems)
+        self.assertEqual(ghb.check_project_paths(self.cfg, fix_mask_paths=True), [])
+
+    def test_tint_file_found_with_odd_name(self):
+        odd = os.path.join(self.cfg.output_dir, " Output_Tint.exr")
+        _write(odd)
+        self.assertEqual(ghb.find_tint_file(self.cfg), odd)
+
+    def test_tint_values_in_cache_signature(self):
+        self._project()
+        self.cfg.use_tint = True
+        self.cfg.tint_params = {"Hue": 0.0}
+        first = ghb.build_settings(self.cfg)
+        self.cfg.tint_params = {"Hue": 0.3}
+        self.assertNotEqual(first, ghb.build_settings(self.cfg))
+
+
+class MaskInputTests(unittest.TestCase):
+    def test_auto_prefers_a_painted_mask(self):
+        self.assertEqual(ghb.choose_mask_layer(
+            {"height": (-60, 80), "mask": (0, 0.7)}), ("mask", 0.0, 1.0))
+
+    def test_auto_falls_back_to_height_for_empty_mask(self):
+        # e.g. a heightfield_noise used as a procedural mask
+        self.assertEqual(ghb.choose_mask_layer(
+            {"height": (-60, 80), "mask": (0, 0)}), ("height", -60.0, 80.0))
+
+    def test_auto_single_volume_and_out_of_range_mask(self):
+        self.assertEqual(ghb.choose_mask_layer({"density": (0, 5)}),
+                         ("density", 0.0, 5.0))
+        self.assertEqual(ghb.choose_mask_layer({"mask": (-1, 3)}),
+                         ("mask", -1.0, 3.0))  # stretched, not clamped
+
+    def test_constant_layers(self):
+        layer, low, high = ghb.choose_mask_layer({"height": (5, 5)}, "height")
+        self.assertTrue(low < 5 <= high)  # maps to 1
+        layer, low, high = ghb.choose_mask_layer({"height": (0, 0)}, "height")
+        self.assertTrue(low <= 0 < high)  # maps to 0
+
+    def test_explicit_layer(self):
+        self.assertEqual(ghb.choose_mask_layer(
+            {"height": (0, 10), "mask": (0, 1)}, "height")[0], "height")
+        with self.assertRaises(ValueError):
+            ghb.choose_mask_layer({"mask": (0, 1)}, "flow")
+        with self.assertRaises(ValueError):
+            ghb.choose_mask_layer({})
+
+    def _project(self, tmp, mask_path):
+        cfg = ghb.BridgeConfig(bridge_dir=os.path.join(tmp, "b"),
+                               gaea_project=os.path.join(tmp, "p.terrain"))
+        nodes = {
+            "828": {"$type": "QuadSpinner.Gaea.Nodes.File, Gaea.Nodes", "Id": 828,
+                    "Name": "File", "FileName": cfg.input_path},
+            "883": {"$type": "QuadSpinner.Gaea.Nodes.File, Gaea.Nodes", "Id": 883,
+                    "Name": "File", "FileName": mask_path},
+            "363": {"$type": "QuadSpinner.Gaea.Nodes.Erosion2, Gaea.Nodes",
+                    "Id": 363, "Name": "Erosion2", "Ports": {"$values": [
+                        {"Name": "In", "Record": {"From": 828, "ToPort": "In"}},
+                        {"Name": "Mask", "Record": {"From": 883, "ToPort": "Mask"}}]}},
+            "475": {"$type": "QuadSpinner.Gaea.Nodes.Export, Gaea.Nodes",
+                    "Name": "output_height", "Location": "Custom",
+                    "OutputPath": cfg.output_dir},
+        }
+        with open(cfg.gaea_project, "w", encoding="utf-8") as handle:
+            json.dump({"Assets": {"$values": [{"Terrain": {"Nodes": nodes}}]}}, handle)
+        return cfg
+
+    def test_mask_file_detected_and_checked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._project(tmp, "")
+            with open(cfg.gaea_project, encoding="utf-8") as handle:
+                masks = ghb.mask_file_nodes(json.load(handle))
+            self.assertEqual([m["Id"] for m in masks], [883])
+            problems = " ".join(ghb.check_project_paths(cfg))
+            self.assertIn("Mask port", problems)
+            self.assertIn("input_mask.exr", problems)
+            # Template mode fixes it in the copy instead of complaining.
+            self.assertEqual(ghb.check_project_paths(cfg, fix_mask_paths=True), [])
+
+    def test_mask_file_ok_when_pointing_to_the_mask(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._project(tmp, "")
+            cfg = self._project(tmp, cfg.mask_input_path)
+            self.assertEqual(ghb.check_project_paths(cfg), [])
+
+    def test_template_copy_points_mask_file_to_the_mask(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._project(tmp, "")
+            dst = os.path.join(tmp, "copy.terrain")
+            self.assertIn("mask file", ghb.write_template_copy(cfg, dst))
+            with open(dst, encoding="utf-8") as handle:
+                data = json.load(handle)
+            mask = ghb.mask_file_nodes(data)[0]
+            self.assertTrue(ghb._same_path(mask["FileName"], cfg.mask_input_path))
+            height = data["Assets"]["$values"][0]["Terrain"]["Nodes"]["828"]
+            self.assertTrue(ghb._same_path(height["FileName"], cfg.input_path))
 
 
 class PostprocessSnippetTests(unittest.TestCase):
@@ -635,6 +801,9 @@ class _FakeNode:
         self._parms = {k: _FakeParm(v) for k, v in values.items()}
 
     def parm(self, name):
+        return self._parms.get(name)
+
+    def parmTuple(self, name):  # noqa: N802 (mirrors the hou API)
         return self._parms.get(name)
 
 

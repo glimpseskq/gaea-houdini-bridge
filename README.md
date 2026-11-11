@@ -96,22 +96,51 @@ again (and reload the module or restart Houdini); existing nodes pick up the new
 ### In Houdini: export
 
 1. Build a terrain, for example `heightfield` ▸ `heightfield_noise`.
-2. Create a **Gaea Erosion Bridge** node and connect the HeightField to its input.
+2. Create a **Gaea Erosion Bridge** node and connect the HeightField to its first input.
+   Optionally connect a mask to the second input (see [Mask input](#mask-input)).
 3. On the **Paths** tab, set **Bridge Dir** (default: `C:/Temp/gh_bridge`) and
    **Gaea Project** (`.terrain`; the bridge reads the Gaea world size from it). For the
    **Open Project in Gaea** button, also set **Gaea Exe**.
 4. On the **Bridge** tab, pick an **Export Resolution**: Full, 1/2, 1/3 or 1/4 of the
    HeightField resolution.
 5. Press **1. Export to Gaea**. `Bridge Dir` now contains `input_height.exr`,
-   `gh_bridge_manifest.json` and an empty `output/` folder.
+   `input_mask.exr`, `gh_bridge_manifest.json` and an empty `output/` folder.
 
    The `height` layer is written as a grayscale RGB EXR. Heights are rescaled to Gaea's
    world size so the terrain keeps its proportions 1:1 (see [Height scale](#height-scale)).
 
+### Mask input
+
+The node's second input takes a mask that limits where Gaea erodes. It is written to
+`<Bridge Dir>/input_mask.exr`, at the same size as the terrain (0 = untouched,
+1 = full effect). Without a second input the mask is white everywhere, so the project
+always gets a valid file.
+
+Any mask works. It is resampled onto the terrain's grid, so its resolution, size and
+position don't matter; outside its area the mask is 0. What is used (**Mask Input Layer**
+on the Bridge tab, default **Auto**):
+
+| Second input | Used as the mask |
+|--------------|------------------|
+| HeightField with a painted/computed `mask` (Mask by Feature, Paint, …) | its `mask` layer, as is (0.3 stays 0.3) |
+| HeightField with an empty `mask` (e.g. `heightfield_noise`) | its `height`, stretched to 0..1 |
+| Any other volume (e.g. a fog volume `density`) | that volume, stretched to 0..1 |
+| Plain geometry (polygons, curves…) | where the geometry is, seen from above (HeightField Mask by Object) |
+
+Set **Mask Input Layer** to a layer name to force one. Status reports which layer was used
+and how much of the terrain it covers, and warns when the mask doesn't overlap the
+terrain. The mask is part of the cache: changing it triggers a rebuild.
+
+In Gaea, add a second **File** node and wire it into the **Mask** port of the node it
+should limit (e.g. Erosion2). It must load `<Bridge Dir>/input_mask.exr`; with
+**Use Erosion Template** the bridge sets that path in the build copy automatically, and
+without it a build refuses to start, with the reason in Status, if the path is wrong.
+
 ### In Gaea: set up the project (once)
 
 1. Open the project (manually or with the **Open Project in Gaea** button).
-2. Load `input_height.exr` with a **File** node and build your erosion graph.
+2. Load `input_height.exr` with a **File** node and build your erosion graph. For the mask,
+   wire a second **File** node loading `input_mask.exr` into Erosion2's **Mask** port.
 3. Attach an **Export** node to each output you need. On every Export node set Format
    **EXR**, Location **Custom**, Output Path `<Bridge Dir>/output` (a folder) and
    If File Exists **Overwrite**, then rename the node: in Custom mode Gaea names the file
@@ -125,6 +154,7 @@ again (and reload the module or restart Houdini); existing nodes pick up the new
 | Flow      | `output_flow`     | `flow`     |
 | Wear      | `output_wear`     | `wear`     |
 | Deposits  | `output_sediment` | `sediment` |
+| Tint (color node) | `output_tint` | shown on the terrain, not a layer (see [Tint](#tint)) |
 
 You don't have to wire up every output: the bridge imports whatever it finds. File names
 are matched ignoring case and leading/trailing spaces.
@@ -189,6 +219,26 @@ can serve many Houdini scenes with different settings.
   is imported, **all parameters of the node are locked**; only **Cancel Build** stays
   available and unlocks the node. A node is never reopened locked after a scene reload.
 
+### Tint
+
+A Gaea **Tint** node (for example on Erosion2's Out) with an Export node named
+`output_tint` produces a color map of the terrain. It is built together with everything
+else on every build and loaded by the import, but it is never an output or a layer of the
+node: it is only shown on the terrain, when **Show Tint on Terrain** is on (Tint tab).
+The display is a HeightField Quick Shade material with the color map as base texture, on
+the Terrain output; the Terrain geometry itself stays the same.
+
+The **Tint** tab works like the Erosion tab: turn on **Use Tint Parameters** and all Tint
+values appear, read from the project (Start and End colors, Hue, Saturation, Lightness,
+Enhance None/Autolevel/Equalize, Reverse). They go into the same build copy as the
+Erosion values; the project itself is not changed. **Read from Project** /
+**Reset to Gaea Defaults** reload the values, **Tint Node** picks the node if there are
+several. The values are part of the cache, and **Auto Build on Change** reacts to them too.
+
+Build copies also set the bridge's Export nodes (`output_*`, including `output_tint`) to
+Location Custom, Output Path `<Bridge Dir>/output`, Format EXR, so a new Export node only
+needs the right name.
+
 ### In Houdini: import
 
 Press **3. Import Results** (or let **Build in Gaea** / **Auto Import** do it). From then
@@ -235,6 +285,7 @@ It pauses while a **Build in Gaea** is running, since that build imports by itse
 | Parameter | What it does |
 |-----------|--------------|
 | **Export Resolution** | Full / 1/2 / 1/3 / 1/4 of the input HeightField resolution. The terrain keeps its size; only the pixel count drops (a 500×500 HeightField at 1/2 exports as 250×250). |
+| **Mask Input Layer** | Which layer of the second input becomes the Gaea mask: Auto, `mask`, `height` or any layer name (see [Mask input](#mask-input)). |
 | **Export > Build > Import** | The whole round trip without opening Gaea. |
 | **1. Export to Gaea** / **2. Build in Gaea** / **3. Import Results** | The same steps one at a time. |
 | **Cancel Build** | Stop a running Swarm build. |
@@ -255,6 +306,16 @@ It pauses while a **Build in Gaea** is running, since that build imports by itse
 | **Erosion Node** | Which Erosion2 node to drive; empty = the only one. |
 | **Read from Project** / **Reset to Gaea Defaults** | Load the template's values / Gaea's defaults. |
 | **General**, **Sediment Discharge**, **Shape**, **Orographic Influence** | The Erosion2 parameters, with Gaea's ranges. |
+
+**Tint tab**
+
+| Parameter | What it does |
+|-----------|--------------|
+| **Show Tint on Terrain** | Show Gaea's Tint color map on the Terrain output (display material only). |
+| **Export > Build > Import**, **Status** | Same as on the Bridge tab. |
+| **Use Tint Parameters** | Build with the Tint values below (see [Tint](#tint)). The rest of the tab is shown only when this is on. |
+| **Tint Node**, **Read from Project**, **Reset to Gaea Defaults** | Which Tint node to drive; load its values / Gaea's defaults. |
+| **Tint**, **Processing** | Start, End, Hue, Saturation, Lightness; Enhance, Reverse — with Gaea's ranges. |
 
 **Gaea Layers tab**
 
@@ -422,7 +483,7 @@ or with `hython` from your Houdini install if you have no standalone Python:
 & "C:\Program Files\Side Effects Software\Houdini XX.X.XXX\bin\hython.exe" tests/test_bridge_logic.py -v
 ```
 
-Expected result: `Ran 58 tests ... OK`. The tests also simulate Houdini 19.5's
+Expected result: `Ran 73 tests ... OK`. The tests also simulate Houdini 19.5's
 `hou.Volume` and check that the sources parse as Python 3.7.
 
 ## Limitations
