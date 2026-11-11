@@ -88,6 +88,7 @@ else:
 ON_LOADED_SCRIPT = r"""
 try:
     import houdini_gaea_bridge as ghb
+    ghb.unlock_after_load(kwargs['node'])
     ghb.sync_auto_import(kwargs['node'])
 except Exception as error:
     print('Gaea Erosion Bridge: could not resume Auto Import: {}'.format(error))
@@ -119,6 +120,11 @@ ghb.cancel_build(kwargs['node'])
 TEMPLATE_CALLBACK = r"""
 import houdini_gaea_bridge as ghb
 ghb.on_template_toggled(kwargs['node'])
+""".strip()
+
+EROSION_CHANGED_CALLBACK = r"""
+import houdini_gaea_bridge as ghb
+ghb.on_erosion_parm_changed(kwargs['node'])
 """.strip()
 
 READ_TEMPLATE_CALLBACK = r"""
@@ -298,6 +304,16 @@ def _build_network(subnet):
     for index, (name, branch) in enumerate(branches):
         result = _switch(subnet, name.lower() + "_imported_switch", (source, branch),
                          'ch("../_imported")')
+        # Put every layer back onto the input HeightField's grid, so the outputs
+        # keep the input's voxel size and resolution instead of Gaea's.
+        on_input_grid = subnet.createNode("heightfield_layer",
+                                          name.lower() + "_to_input_grid")
+        on_input_grid.setInput(0, source)
+        on_input_grid.setInput(1, result)
+        _setp(on_input_grid, "mode", "replace")
+        _setp(on_input_grid, "layer", "*")
+        result = _switch(subnet, name.lower() + "_grid_switch",
+                         (result, on_input_grid), 'ch("../keep_input_res")')
         out = subnet.createNode("output", name)
         out.setInput(0, result)
         _setp(out, "outputidx", index)
@@ -356,16 +372,38 @@ def _mask_folder(layer, label, help_text):
 def _erosion_parm(name, label, kind, default, low, high):
     parm_name = ghb.EROSION_PARM_PREFIX + name
     help_text = "Gaea Erosion2 '{}' (default {}).".format(name, default)
+    # Every Erosion value triggers Auto Build on Change (if it's on).
+    callback = dict(script_callback=EROSION_CHANGED_CALLBACK,
+                    script_callback_language=hou.scriptLanguage.Python)
     if kind == "bool":
         return hou.ToggleParmTemplate(parm_name, label, default_value=bool(default),
-                                      help=help_text)
+                                      help=help_text, **callback)
     if kind == "int":
         return hou.IntParmTemplate(parm_name, label, 1, default_value=(int(default),),
                                    min=low, max=high, min_is_strict=True,
-                                   max_is_strict=True, help=help_text)
+                                   max_is_strict=True, help=help_text, **callback)
     return hou.FloatParmTemplate(parm_name, label, 1, default_value=(float(default),),
                                  min=low, max=high, min_is_strict=True,
-                                 max_is_strict=True, help=help_text)
+                                 max_is_strict=True, help=help_text, **callback)
+
+
+# While a build started by Auto Build on Change runs, every parameter is disabled
+# through this condition, except the ones that must stay usable.
+LOCK_CONDITION = "{ _locked == 1 }"
+NEVER_LOCKED = ("cancel_build", "cancel_build_erosion")
+
+
+def _with_lock(template):
+    """Add the lock condition to a parameter template (recursing into folders)."""
+    if template.type() == hou.parmTemplateType.Folder:
+        template.setParmTemplates([_with_lock(t) for t in template.parmTemplates()])
+        return template
+    if template.isHidden() or template.name() in NEVER_LOCKED:
+        return template
+    current = template.conditionals().get(hou.parmCondType.DisableWhen, "")
+    template.setConditional(hou.parmCondType.DisableWhen,
+                            (current + " " + LOCK_CONDITION).strip())
+    return template
 
 
 def _status_parm(name):
@@ -383,6 +421,14 @@ def _erosion_tab():
     tab.addParmTemplate(_button(
         "run_cycle_erosion", "Export > Build > Import", CYCLE_CALLBACK,
         "Same as on the Bridge tab: export, build in Gaea with these values, import."))
+    tab.addParmTemplate(hou.ToggleParmTemplate(
+        "auto_rebuild", "Auto Build on Change", default_value=False,
+        help="Run Export > Build > Import automatically whenever an Erosion value "
+             "changes (once you stop changing it). While it runs, the whole node is "
+             "locked until the result is imported; Cancel Build unlocks it. Needs "
+             "Use Erosion Template."))
+    tab.addParmTemplate(_button("cancel_build_erosion", "Cancel Build", CANCEL_CALLBACK,
+                                "Stop the running build and unlock the node."))
     tab.addParmTemplate(_status_parm("_status_erosion"))
     tab.addParmTemplate(hou.ToggleParmTemplate(
         "use_template", "Use Erosion Template", default_value=False,
@@ -458,8 +504,9 @@ def _build_parm_template_group():
                                    folder_type=hou.folderType.Collapsible)
     build.addParmTemplate(hou.MenuParmTemplate(
         "build_resolution", "Build Resolution",
-        ("0", "512", "1024", "2048", "4096", "8192"),
-        menu_labels=("From Project", "512", "1K", "2K", "4K", "8K"), default_value=0,
+        ("0", "512", "1024", "2048", "4096", "8192", "16384"),
+        menu_labels=("From Project", "512", "1K", "2K", "4K", "8K", "16K"),
+        default_value=0,
         help="Resolution Gaea builds at (Swarm --resolution). From Project = the "
              "project's Terrain Definition."))
     build.addParmTemplate(hou.ToggleParmTemplate(
@@ -496,6 +543,11 @@ def _build_parm_template_group():
         menu_labels=("Gaea Result", "Input HeightField"), default_value=0,
         help="Gaea Result: the eroded terrain from Gaea. Input HeightField: keep the "
              "original height and only add the Gaea masks to it."))
+    layers.addParmTemplate(hou.ToggleParmTemplate(
+        "keep_input_res", "Keep Input Resolution", default_value=True,
+        help="Resample every output onto the input HeightField's grid (HeightField "
+             "Layer, Replace), so it keeps the input's voxel size and resolution. "
+             "Off: outputs keep the resolution Gaea built at."))
     layers.addParmTemplate(hou.MenuParmTemplate(
         "view_mask", "Show Mask", ("none",) + MASK_LAYERS,
         menu_labels=("None", "Flow", "Wear", "Sediment"), default_value=0,
@@ -553,8 +605,10 @@ def _build_parm_template_group():
             "_{}_peak".format(layer), layer + " peak", 1, default_value=(0.0,))))
     for name in ("_enc_span", "_enc_offset", "_houdini_width"):
         g.append(_hidden(hou.FloatParmTemplate(name, name, 1, default_value=(0.0,))))
+    g.append(_hidden(hou.ToggleParmTemplate("_locked", "Locked during auto build",
+                                            default_value=False)))
 
-    return g
+    return hou.ParmTemplateGroup([_with_lock(t) for t in g.entries()])
 
 
 def _set_io_labels(definition, inputs, outputs):

@@ -183,6 +183,11 @@ can serve many Houdini scenes with different settings.
   template's values.
 - With the mode off, Swarm builds the project exactly as saved, and builds in the Gaea GUI
   (F8) never see the Houdini values.
+- **Auto Build on Change** (under the Export > Build > Import button on the Erosion tab)
+  starts that cycle by itself whenever an Erosion value changes, once you stop changing it
+  (0.75 s, so dragging a slider starts one build). From the first change until the result
+  is imported, **all parameters of the node are locked**; only **Cancel Build** stays
+  available and unlocks the node. A node is never reopened locked after a scene reload.
 
 ### In Houdini: import
 
@@ -203,7 +208,9 @@ process them on their own (Blur, Mask by Feature…) first. Viewing one shows it
 red on the terrain. A mask whose file wasn't found comes out empty.
 
 The **Status** field lists what was found. The terrain comes back at its original world
-size and height; its resolution is that of the images Gaea exported.
+size and height. With **Keep Input Resolution** (on by default) every output is put back
+onto the input HeightField's grid with HeightField Layer (Replace), so it has exactly the
+input's resolution and voxel size; turn it off to keep the resolution Gaea built at.
 
 Import only stores the found files in the node; all settings on the **Gaea Layers** tab
 work live, without importing again. After a new build in the Gaea GUI, press
@@ -232,7 +239,7 @@ It pauses while a **Build in Gaea** is running, since that build imports by itse
 | **1. Export to Gaea** / **2. Build in Gaea** / **3. Import Results** | The same steps one at a time. |
 | **Cancel Build** | Stop a running Swarm build. |
 | **Open Project in Gaea** | Launches the Gaea GUI with the project from **Paths**. |
-| **Gaea Build Options** | **Build Resolution** (From Project, 512…8K; Swarm `--resolution`), **Ignore Baked Cache** (`--ignorecache`), **Show Build Window** (Swarm's console, for diagnostics). |
+| **Gaea Build Options** | **Build Resolution** (From Project, 512…16K; Swarm `--resolution`), **Ignore Baked Cache** (`--ignorecache`), **Show Build Window** (Swarm's console, for diagnostics). |
 | **Auto Import After Build** | Import as soon as **2. Build in Gaea** finishes (default on). |
 | **Auto Import (Gaea GUI builds)** | Import automatically when a build in the Gaea GUI writes new files (see above). |
 | **Clear Import** | Forget the imported files; the node passes its input through. Also turns Auto Import (Gaea GUI builds) off. |
@@ -242,6 +249,8 @@ It pauses while a **Build in Gaea** is running, since that build imports by itse
 | Parameter | What it does |
 |-----------|--------------|
 | **Export > Build > Import**, **Status** | The same button and status line as on the Bridge tab, so you can tweak and rebuild without leaving this tab. |
+| **Auto Build on Change** | Rebuild automatically when an Erosion value changes; the node stays locked until the result is imported. |
+| **Cancel Build** | Stop the build and unlock the node. |
 | **Use Erosion Template** | Build a copy of the project with the Erosion2 values below (see [Erosion template](#erosion-template-tune-gaeas-erosion-from-houdini)). The rest of the tab is shown only when this is on. |
 | **Erosion Node** | Which Erosion2 node to drive; empty = the only one. |
 | **Read from Project** / **Reset to Gaea Defaults** | Load the template's values / Gaea's defaults. |
@@ -252,6 +261,7 @@ It pauses while a **Build in Gaea** is running, since that build imports by itse
 | Parameter | What it does |
 |-----------|--------------|
 | **Height** | *Gaea Result*: the eroded terrain. *Input HeightField*: keep the original height (on all outputs) and only take the masks from Gaea. |
+| **Keep Input Resolution** | Put every output back onto the input HeightField's grid (same resolution and voxel size as the input). Off: keep Gaea's build resolution. |
 | **Show Mask** | None / Flow / Wear / Sediment: preview that mask in red on the Terrain output (it goes into the Terrain output's `mask`). Set back to None before using the Terrain output downstream, otherwise HeightField nodes will use that mask. |
 | **Flow / Wear / Sediment** | One settings section per mask, see below. All three are always active, each for its own output. |
 

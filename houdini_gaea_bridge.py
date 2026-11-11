@@ -557,6 +557,7 @@ class SwarmBuild:
         self.command = command or swarm_command(config)
         self.started = time.time()
         self.note = ""
+        self.on_done = None
         self._process = None
 
     def start(self):
@@ -1731,13 +1732,23 @@ def _finish_build(node, job, then_import):
     return ok, message
 
 
-def build_in_gaea(node, then_import=None, wait=None):
+def _call_done(on_done, ok):
+    if on_done is not None:
+        try:
+            on_done(ok)
+        except Exception:  # a finished build must never raise from here
+            pass
+
+
+def build_in_gaea(node, then_import=None, wait=None, on_done=None):
     """Build the node's Gaea project with Gaea.Swarm.exe, then import the result.
 
     ``then_import`` None follows the node's Auto Import After Build toggle. In the
     Houdini UI the build runs in the background: Status shows the elapsed time and
     the import happens when Swarm exits. Without a UI (hython) it blocks until
-    done. Returns the SwarmBuild, or None when the build couldn't start.
+    done. ``on_done(ok)`` is called once the build is over (also when it couldn't
+    start, failed or was cancelled). Returns the SwarmBuild, or None when the
+    build couldn't start.
     """
     import hou
 
@@ -1746,11 +1757,13 @@ def build_in_gaea(node, then_import=None, wait=None):
         then_import = True if parm is None else bool(parm.eval())
     if is_building(node):
         _set_status(node, "A Gaea build is already running for this node.")
+        _call_done(on_done, False)
         return None
     config = config_from_node(node)
     problems = validate_build(config)
     if problems:
         _set_status(node, "Cannot build: " + "  ".join(problems))
+        _call_done(on_done, False)
         return None
 
     note = ""
@@ -1762,11 +1775,16 @@ def build_in_gaea(node, then_import=None, wait=None):
         note = " (template; changed: {})".format(", ".join(changed) or "nothing")
     job = SwarmBuild(config, command=command).start()
     job.note = note
+    job.on_done = on_done
     if wait is None:
         wait = not hou.isUIAvailable()
     if wait:
         job.wait()
-        _finish_build(node, job, then_import)
+        ok = False
+        try:
+            ok, _ = _finish_build(node, job, then_import)
+        finally:
+            _call_done(on_done, ok)
         return job
 
     key = node.sessionId()
@@ -1788,11 +1806,14 @@ def build_in_gaea(node, then_import=None, wait=None):
                 job.note, job.elapsed))
             return
         _stop_build_watch(key)
+        ok = False
         try:
-            _finish_build(target, job, then_import)
+            ok, _ = _finish_build(target, job, then_import)
         except Exception as error:
             _set_status(target, "Gaea build finished, but import failed: {}".format(
                 error))
+        finally:
+            _call_done(job.on_done, ok)
 
     _build_registry()[key] = {"job": job, "callback": tick}
     hou.ui.addEventLoopCallback(tick)
@@ -1813,34 +1834,146 @@ def _stop_build_watch(key):
 
 
 def cancel_build(node):
-    """Stop the node's running Swarm build, if any."""
+    """Stop the node's running Swarm build (or a pending auto rebuild) and unlock."""
+    _cancel_pending_rebuild(node.sessionId())
     entry = _stop_build_watch(node.sessionId())
     if entry is None or entry["job"].poll() is not None:
+        set_locked(node, False)
         _set_status(node, "No Gaea build is running.")
         return False
     entry["job"].cancel()
+    _call_done(getattr(entry["job"], "on_done", None), False)
+    set_locked(node, False)
     _set_status(node, "Gaea build cancelled after {:.0f} s.".format(
         entry["job"].elapsed))
     return True
 
 
-def run_full_cycle(node, wait=None):
+def run_full_cycle(node, wait=None, on_done=None):
     """Export -> build in Gaea (Swarm) -> import, all from the node.
 
     When the export cache says nothing changed and the outputs exist, the build is
-    skipped and the existing outputs are imported.
+    skipped and the existing outputs are imported. ``on_done(ok)`` is called when
+    everything is over (see ``build_in_gaea``).
     """
-    source = node.inputs()[0] if node.inputs() else None
-    if source is None:
-        raise RuntimeError("Connect a HeightField into the Gaea Erosion Bridge input.")
-    config = config_from_node(node)
-    export = export_for_gaea(source, config)
-    if export["cache_hit"]:
-        result = import_into_node(node, config)
-        _set_status(node, "Nothing changed since the last build.  " + result["message"])
-        return None
+    try:
+        source = node.inputs()[0] if node.inputs() else None
+        if source is None:
+            raise RuntimeError(
+                "Connect a HeightField into the Gaea Erosion Bridge input.")
+        config = config_from_node(node)
+        export = export_for_gaea(source, config)
+        if export["cache_hit"]:
+            result = import_into_node(node, config)
+            _set_status(node, "Nothing changed since the last build.  "
+                        + result["message"])
+            _call_done(on_done, True)
+            return None
+    except Exception:
+        _call_done(on_done, False)
+        raise
     _set_status(node, export["message"])
-    return build_in_gaea(node, then_import=True, wait=wait)
+    return build_in_gaea(node, then_import=True, wait=wait, on_done=on_done)
+
+
+# --------------------------------------------------------------------------- #
+# Auto Build on Change (Erosion tab) and node locking
+# --------------------------------------------------------------------------- #
+
+AUTO_REBUILD_DELAY = 0.75  # s after the last change (a slider drag fires many)
+
+
+def set_locked(node, locked):
+    """Lock or unlock every parameter of the node (they are disabled while the
+    hidden _locked toggle is on; Cancel Build stays available)."""
+    import hou
+
+    try:
+        parm = node.parm("_locked")
+        if parm is not None:
+            parm.set(1 if locked else 0)
+    except hou.ObjectWasDeleted:
+        pass
+
+
+def _pending_registry():
+    import hou
+
+    registry = getattr(hou.session, "_ghb_pending_rebuilds", None)
+    if registry is None:
+        registry = {}
+        hou.session._ghb_pending_rebuilds = registry
+    return registry
+
+
+def _cancel_pending_rebuild(key):
+    import hou
+
+    entry = _pending_registry().pop(key, None)
+    if entry and hou.isUIAvailable():
+        try:
+            hou.ui.removeEventLoopCallback(entry["callback"])
+        except hou.OperationFailed:
+            pass
+    return entry is not None
+
+
+def _start_auto_rebuild(node):
+    import hou
+
+    key = node.sessionId()
+
+    def done(ok):
+        target = hou.nodeBySessionId(key)
+        if target is not None:
+            set_locked(target, False)
+
+    try:
+        run_full_cycle(node, on_done=done)
+    except Exception as error:
+        set_locked(node, False)
+        _set_status(node, "Auto build failed: {}".format(error))
+
+
+def on_erosion_parm_changed(node):
+    """Callback of every Erosion parameter: with Auto Build on Change, lock the
+    node and run Export > Build > Import once the values stop changing."""
+    import hou
+
+    toggle = node.parm("auto_rebuild")
+    if toggle is None or not toggle.eval() or not node.evalParm("use_template"):
+        return False
+    set_locked(node, True)
+    if not hou.isUIAvailable():
+        _start_auto_rebuild(node)
+        return True
+
+    key = node.sessionId()
+    registry = _pending_registry()
+    due = time.monotonic() + AUTO_REBUILD_DELAY
+    if key in registry:
+        registry[key]["due"] = due
+        return True
+
+    def tick():
+        entry = registry.get(key)
+        if entry is None or time.monotonic() < entry["due"]:
+            return
+        _cancel_pending_rebuild(key)
+        target = hou.nodeBySessionId(key)
+        if target is not None:
+            _start_auto_rebuild(target)
+
+    registry[key] = {"due": due, "callback": tick}
+    hou.ui.addEventLoopCallback(tick)
+    _set_status(node, "Erosion changed: rebuilding in Gaea. The node is locked until "
+                      "the result is imported.")
+    return True
+
+
+def unlock_after_load(node):
+    """Builds don't survive closing a scene: never reopen a node locked."""
+    set_locked(node, False)
 
 
 def sync_auto_import(node):
