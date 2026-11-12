@@ -495,76 +495,181 @@ class TintTests(unittest.TestCase):
         import shutil
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def _project(self, tint=None, tint_export=None):
+    # Erosion2 port feeding each layer's Tint, as in the user's graph.
+    PORTS = {"height": "Out", "flow": "Flow", "wear": "Wear", "sediment": "Deposits"}
+
+    def _project(self, tints=None, layers=None, tint_export=None):
+        """Erosion2 -> Tint -> Export " output_tint_<layer>" for each layer; all
+        Tint nodes are named "Tint" like in Gaea."""
+        def port(name, source=None, source_port="Out"):
+            value = {"Name": name, "Type": "In"}
+            if source is not None:
+                value["Record"] = {"From": source, "FromPort": source_port,
+                                   "ToPort": name}
+            return value
+
         nodes = {
             "1": {"$type": "QuadSpinner.Gaea.Nodes.File, Gaea.Nodes", "Id": 1,
                   "FileName": self.cfg.input_path},
-            "2": {"$type": "QuadSpinner.Gaea.Nodes.Export, Gaea.Nodes",
+            "2": {"$type": "QuadSpinner.Gaea.Nodes.Erosion2, Gaea.Nodes", "Id": 2,
+                  "Name": "Erosion2", "Ports": {"$values": [port("In", 1)]}},
+            "3": {"$type": "QuadSpinner.Gaea.Nodes.Export, Gaea.Nodes", "Id": 3,
                   "Name": "output_height", "Location": "Custom",
-                  "OutputPath": self.cfg.output_dir},
-            "3": dict({"$type": "QuadSpinner.Gaea.Nodes.Tint, Gaea.Nodes",
-                       "Name": "Tint"}, **(tint or {})),
-            "4": dict({"$type": "QuadSpinner.Gaea.Nodes.Export, Gaea.Nodes",
-                       "Name": " output_tint"}, **(tint_export or {})),
+                  "OutputPath": self.cfg.output_dir,
+                  "Ports": {"$values": [port("In", 2)]}},
         }
+        for index, layer in enumerate(ghb.TINT_LAYERS if layers is None else layers):
+            tint_id, export_id = 10 + index, 20 + index
+            nodes[str(tint_id)] = dict(
+                {"$type": "QuadSpinner.Gaea.Nodes.Tint, Gaea.Nodes", "Id": tint_id,
+                 "Name": "Tint",
+                 "Ports": {"$values": [port("In", 2, self.PORTS[layer])]}},
+                **((tints or {}).get(layer) or {}))
+            nodes[str(export_id)] = dict(
+                {"$type": "QuadSpinner.Gaea.Nodes.Export, Gaea.Nodes",
+                 "Id": export_id, "Name": " output_tint_" + layer,
+                 "Ports": {"$values": [port("In", tint_id)]}},
+                **(tint_export or {}))
         with open(self.cfg.gaea_project, "w", encoding="utf-8") as handle:
             json.dump({"Assets": {"$values": [{"Terrain": {"Nodes": nodes}}]}}, handle)
+
+    def _copy_nodes(self, dst):
+        with open(dst, encoding="utf-8") as handle:
+            return json.load(handle)["Assets"]["$values"][0]["Terrain"]["Nodes"]
 
     def test_spec(self):
         self.assertEqual([s[0] for s in ghb.TINT_PARAMS],
                          ["Start", "End", "Hue", "Saturation", "Lightness",
                           "Enhance", "Reverse"])
+        self.assertEqual(ghb.TINT_LAYERS, ("height", "flow", "wear", "sediment"))
+        self.assertEqual(ghb.tint_parm_name("flow", "Start"), "tint_flow_Start")
+
+    def test_tint_nodes_found_through_their_exports(self):
+        self._project({"flow": {"Hue": 0.25}, "sediment": {"Hue": -0.5}})
+        values = ghb.read_tint_params(self.cfg.gaea_project, self.cfg)
+        self.assertEqual(sorted(values), sorted(ghb.TINT_LAYERS))
+        self.assertEqual(values["flow"]["Hue"], 0.25)
+        self.assertEqual(values["sediment"]["Hue"], -0.5)
+        self.assertEqual(values["height"]["Hue"], 0.0)  # Gaea default
+
+    def test_tint_upstream_through_other_nodes(self):
+        self._project(layers=("wear",))
+        path = self.cfg.gaea_project
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        nodes = data["Assets"]["$values"][0]["Terrain"]["Nodes"]
+        # Tint -> Blur -> Export: still the Tint's export
+        nodes["30"] = {"$type": "QuadSpinner.Gaea.Nodes.Blur, Gaea.Nodes", "Id": 30,
+                       "Ports": {"$values": [{"Name": "In", "Record": {"From": 10}}]}}
+        nodes["20"]["Ports"]["$values"][0]["Record"]["From"] = 30
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+        self.assertEqual(list(ghb.read_tint_params(path, self.cfg)), ["wear"])
 
     def test_read_defaults_and_stored_colors(self):
-        self._project({"Start": {"R": 0.2, "G": 0.1, "B": 0.0}, "Hue": 0.5})
-        values = ghb.read_tint_params(self.cfg.gaea_project)
+        self._project({"height": {"Start": {"R": 0.2, "G": 0.1, "B": 0.0},
+                                  "Hue": 0.5}})
+        values = ghb.read_tint_params(self.cfg.gaea_project, self.cfg)["height"]
         self.assertEqual(values["Start"], (0.2, 0.1, 0.0))
         self.assertEqual(values["End"], (1.0, 1.0, 1.0))  # Gaea default
         self.assertEqual(values["Enhance"], "Autolevel")
         self.assertEqual(values["Hue"], 0.5)
 
-    def test_copy_writes_tint_values_and_fixes_tint_export(self):
+    def test_copy_writes_each_layers_tint_and_fixes_tint_exports(self):
         self._project()
         self.cfg.use_tint = True
-        self.cfg.tint_params = dict(ghb.read_tint_params(self.cfg.gaea_project))
-        self.cfg.tint_params.update(Start=(1.0, 0.0, 0.0), Enhance="Equalize",
-                                    Reverse=True)
+        self.cfg.tint_params = ghb.read_tint_params(self.cfg.gaea_project, self.cfg)
+        self.cfg.tint_params["flow"].update(Start=(1.0, 0.0, 0.0), Enhance="Equalize")
+        self.cfg.tint_params["sediment"].update(Reverse=True)
         dst = os.path.join(self.tmp, "copy.terrain")
         changed = ghb.write_template_copy(self.cfg, dst)
-        self.assertEqual(changed, ["Tint Enhance", "Tint Reverse", "Tint Start",
-                                   "export paths"])
-        with open(dst, encoding="utf-8") as handle:
-            nodes = json.load(handle)["Assets"]["$values"][0]["Terrain"]["Nodes"]
-        self.assertEqual(nodes["3"]["Start"], {"R": 1.0, "G": 0.0, "B": 0.0})
-        self.assertEqual(nodes["3"]["Enhance"], "Equalize")
-        self.assertNotIn("End", nodes["3"])  # unchanged -> not written
-        self.assertEqual(nodes["4"]["Location"], "Custom")
-        self.assertTrue(ghb._same_path(nodes["4"]["OutputPath"], self.cfg.output_dir))
+        self.assertEqual(changed, ["Tint flow Enhance", "Tint flow Start",
+                                   "Tint sediment Reverse", "export paths"])
+        nodes = self._copy_nodes(dst)
+        self.assertEqual(nodes["11"]["Start"], {"R": 1.0, "G": 0.0, "B": 0.0})
+        self.assertEqual(nodes["11"]["Enhance"], "Equalize")
+        self.assertTrue(nodes["13"]["Reverse"])
+        self.assertNotIn("Start", nodes["10"])  # height tint unchanged
+        for export_id in ("20", "21", "22", "23"):
+            self.assertEqual(nodes[export_id]["Location"], "Custom")
+            self.assertTrue(ghb._same_path(nodes[export_id]["OutputPath"],
+                                           self.cfg.output_dir))
+
+    def test_missing_layer_tints_are_skipped(self):
+        self._project(layers=("height", "flow"))
+        self.cfg.use_tint = True
+        self.cfg.tint_params = {"wear": {"Hue": 0.5}, "flow": {"Hue": 0.5}}
+        changed = ghb.write_template_copy(self.cfg, os.path.join(self.tmp, "c"))
+        self.assertIn("Tint flow Hue", changed)
+        self.assertFalse(any(name.startswith("Tint wear") for name in changed))
 
     def test_bad_enum_is_skipped(self):
         self._project()
         self.cfg.use_tint = True
-        self.cfg.tint_params = {"Enhance": "Sharpen"}
-        self.assertNotIn("Tint Enhance",
+        self.cfg.tint_params = {"height": {"Enhance": "Sharpen"}}
+        self.assertNotIn("Tint height Enhance",
                          ghb.write_template_copy(self.cfg, os.path.join(self.tmp, "c")))
 
-    def test_tint_export_checked_in_plain_builds(self):
-        self._project()  # tint export writes to the build folder
+    def test_tint_exports_checked_in_plain_builds(self):
+        self._project()  # tint exports write to the build folder
         problems = " ".join(ghb.check_project_paths(self.cfg))
-        self.assertIn("output_tint", problems)
+        self.assertIn("output_tint_flow", problems)
         self.assertEqual(ghb.check_project_paths(self.cfg, fix_mask_paths=True), [])
 
-    def test_tint_file_found_with_odd_name(self):
-        odd = os.path.join(self.cfg.output_dir, " Output_Tint.exr")
-        _write(odd)
-        self.assertEqual(ghb.find_tint_file(self.cfg), odd)
+    def test_use_tint_needs_tint_exports(self):
+        self._project(layers=())
+        self.cfg.use_tint = True
+        problems = " ".join(ghb.check_project_paths(self.cfg, fix_mask_paths=True))
+        self.assertIn("No Tint Export", problems)
+
+    def test_tint_files_found_per_layer_with_odd_names(self):
+        flow = os.path.join(self.cfg.output_dir, " Output_Tint_Flow.exr")
+        height = os.path.join(self.cfg.output_dir, "output_tint_height.exr")
+        _write(flow)
+        _write(height)
+        self.assertEqual(ghb.find_tint_file(self.cfg, "flow"), flow)
+        self.assertEqual(ghb.find_tint_files(self.cfg),
+                         {"height": height, "flow": flow})
+
+    def test_display_path_is_new_per_build(self):
+        source = os.path.join(self.cfg.output_dir, "output_tint_flow.exr")
+        _write(source, b"first")
+        first = ghb.tint_display_path(self.cfg, "flow", source)
+        self.assertEqual(first, ghb.tint_display_path(self.cfg, "flow", source))
+        with open(first, "rb") as handle:
+            self.assertEqual(handle.read(), b"first")
+        os.remove(source)  # Gaea writing a new build
+        _write(source, b"second build")
+        os.utime(source, ns=(1, 2_000_000_000_000_000_000))
+        second = ghb.tint_display_path(self.cfg, "flow", source)
+        self.assertNotEqual(first, second)
+        self.assertFalse(os.path.exists(first))  # old map cleaned up
+        with open(second, "rb") as handle:
+            self.assertEqual(handle.read(), b"second build")
+        self.assertEqual(os.path.dirname(second), os.path.join(
+            self.cfg.bridge_dir, ghb.TINT_DISPLAY_SUBDIR))
+
+    def test_fresh_display_path_is_always_new(self):
+        source = os.path.join(self.cfg.output_dir, "output_tint_wear.exr")
+        _write(source, b"map")
+        first = ghb.tint_display_path(self.cfg, "wear", source, fresh=True)
+        second = ghb.tint_display_path(self.cfg, "wear", source, fresh=True)
+        self.assertNotEqual(first, second)
+        self.assertFalse(os.path.exists(first))
+        with open(second, "rb") as handle:
+            self.assertEqual(handle.read(), b"map")
+
+    def test_rewritten_tints_listed_after_layers(self):
+        _write(os.path.join(self.cfg.output_dir, "output_height.exr"))
+        _write(os.path.join(self.cfg.output_dir, "output_tint_wear.exr"))
+        self.assertEqual(ghb.updated_outputs(self.cfg, 0), ["height", "tint_wear"])
 
     def test_tint_values_in_cache_signature(self):
         self._project()
         self.cfg.use_tint = True
-        self.cfg.tint_params = {"Hue": 0.0}
+        self.cfg.tint_params = {"wear": {"Hue": 0.0}}
         first = ghb.build_settings(self.cfg)
-        self.cfg.tint_params = {"Hue": 0.3}
+        self.cfg.tint_params = {"wear": {"Hue": 0.3}}
         self.assertNotEqual(first, ghb.build_settings(self.cfg))
 
 
