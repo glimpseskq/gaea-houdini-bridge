@@ -85,7 +85,7 @@ exec(open(r"C:/path/to/BridgeHGH/build_gaea_bridge_hda.py").read())
 ```
 
 В консоли появится `Installed HDA: ...\otls\gaea_erosion_bridge.hda`, а в сети SOP по
-**Tab** — нода **Gaea Erosion Bridge**.
+**Tab** — нода **Gaea Erosion2 Bridge**.
 
 HDA устанавливается в пользовательскую папку `otls`. Чтобы удалить ассет, удалите оттуда
 файл `gaea_erosion_bridge.hda`. После обновления репозитория запустите сборку ещё раз
@@ -97,7 +97,7 @@ HDA устанавливается в пользовательскую папк�
 ### В Houdini: экспорт
 
 1. Соберите террейн, например `heightfield` ▸ `heightfield_noise`.
-2. Создайте **Gaea Erosion Bridge** и подключите HeightField к его первому входу. Ко
+2. Создайте **Gaea Erosion2 Bridge** и подключите HeightField к его первому входу. Ко
    второму входу при желании подключите маску (см. [Вход маски](#вход-маски)).
 3. На вкладке **Paths** укажите **Bridge Dir** (по умолчанию `C:/Temp/gh_bridge`) и
    **Gaea Project** (`.terrain`; из него мост читает размер мира Gaea). Для кнопки
@@ -154,7 +154,7 @@ HDA устанавливается в пользовательскую папк�
 | Flow      | `output_flow`     | `flow`     |
 | Wear      | `output_wear`     | `wear`     |
 | Deposits  | `output_sediment` | `sediment` |
-| Tint (цветовая нода) | `output_tint` | показывается на рельефе, не слой (см. [Tint](#tint)) |
+| Out / Flow / Wear / Deposits → Tint | `output_tint_height` / `_flow` / `_wear` / `_sediment` | показывается на рельефе, не слой (см. [Tint](#tint)) |
 
 Подключать все выходы не обязательно: мост импортирует то, что найдёт. Имена файлов
 сравниваются без учёта регистра и пробелов по краям.
@@ -221,28 +221,45 @@ Houdini с разными настройками.
 
 ### Tint
 
-Нода Gaea **Tint** (например, на выходе Out у Erosion2) с Export-нодой `output_tint` даёт
-цветовую карту рельефа. Она собирается вместе со всем остальным при каждой сборке и
-загружается импортом, но никогда не становится выходом или слоем ноды: её только видно на
-рельефе, когда включена **Show Tint on Terrain** (вкладка Tint). Отображение — материал
+У каждого слоя может быть своя цветовая карта: нода Gaea **Tint** на одном из выходов
+Erosion2, за ней Export-нода с именем слоя:
+
+```
+Erosion2 Out      -> Tint -> output_tint_height
+Erosion2 Flow     -> Tint -> output_tint_flow
+Erosion2 Wear     -> Tint -> output_tint_wear
+Erosion2 Deposits -> Tint -> output_tint_sediment
+```
+
+Все Tint-ноды могут называться просто «Tint», как их называет Gaea: мост находит каждую,
+идя от её Export-ноды вверх по графу. Все четыре не обязательны.
+
+Тинты собираются вместе со всем остальным при каждой сборке и загружаются импортом, но
+никогда не становятся выходами или слоями ноды — их только видно на рельефе. Выберите
+тинт в **Tint Layer** (Height, Flow, Wear, Sediment) на вкладке Tint и нажмите
+**Toggle Tint** — он появится; повторное нажатие его скрывает. Если сменить слой, пока
+тинт показан, сразу покажется новый. Отображение — материал
 HeightField Quick Shade с картой тинта в качестве базовой текстуры на выходе Terrain; сама
-геометрия Terrain не меняется.
+геометрия Terrain не меняется. Каждый импорт показывает карты под именами конкретной
+сборки в `<Bridge Dir>/tint_display` (жёсткие ссылки на выходные файлы, старые удаляются),
+поэтому пересобранный тинт появляется без сброса кэша текстур вьюпорта.
 
-Вкладка **Tint** устроена как Erosion: включите **Use Tint Parameters**, и появятся все
-параметры Tint, прочитанные из проекта (цвета Start и End, Hue, Saturation, Lightness,
-Enhance None/Autolevel/Equalize, Reverse). Они попадают в ту же копию для сборки, что и
-параметры эрозии; сам проект не меняется. **Read from Project** / **Reset to Gaea
-Defaults** перечитывают значения, **Tint Node** выбирает ноду, если их несколько. Значения
-входят в кэш, и **Auto Build on Change** реагирует и на них.
+Вкладка **Tint** устроена как Erosion: включите **Use Tint Parameters**, и появятся
+подвкладки по слоям со всеми параметрами Tint-ноды этого слоя, прочитанными из проекта
+(цвета Start и End, Hue, Saturation, Lightness, Enhance None/Autolevel/Equalize, Reverse).
+Они попадают в ту же копию для сборки, что и параметры эрозии; сам проект не меняется.
+**Read from Project** / **Reset to Gaea Defaults** перечитывают значения всех слоёв.
+Значения слоя, у которого нет Tint-ноды, игнорируются. Значения входят в кэш, и
+**Auto Build on Change** реагирует и на них.
 
-Копия для сборки также настраивает Export-ноды моста (`output_*`, включая `output_tint`):
-Location Custom, Output Path `<Bridge Dir>/output`, Format EXR — новой Export-ноде нужно
-только правильное имя.
+Копия для сборки также настраивает Export-ноды моста (`output_*`, включая
+`output_tint_*`): Location Custom, Output Path `<Bridge Dir>/output`, Format EXR — новой
+Export-ноде нужно только правильное имя.
 
 ### В Houdini: импорт
 
 Нажмите **3. Import Results** (или это сделают **Build in Gaea** / **Auto Import**). С
-этого момента результат выдаёт сама нода **Gaea Erosion Bridge** (никаких дополнительных
+этого момента результат выдаёт сама нода **Gaea Erosion2 Bridge** (никаких дополнительных
 нод в вашей сети не создаётся), на четырёх выходах:
 
 | Выход | Что в нём |
@@ -312,11 +329,12 @@ Houdini (не в hython и не при batch-рендере) и не трога�
 
 | Параметр | Что делает |
 |----------|------------|
-| **Show Tint on Terrain** | Показать цветовую карту Tint из Gaea на выходе Terrain (только материал отображения). |
+| **Tint Layer** | Какой тинт показывать: Height, Flow, Wear или Sediment (`output_tint_<слой>`). Смена слоя при показанном тинте сразу показывает новый. |
+| **Toggle Tint** | Показать карту тинта из Tint Layer на выходе Terrain (только материал отображения); повторное нажатие скрывает. В Status — какой тинт показан или почему его нельзя показать. |
 | **Export > Build > Import**, **Status** | То же, что на вкладке Bridge. |
 | **Use Tint Parameters** | Собирать со значениями Tint ниже (см. [Tint](#tint)). Остальная вкладка видна только при включённой галке. |
-| **Tint Node**, **Read from Project**, **Reset to Gaea Defaults** | Какой нодой Tint управлять; загрузить её значения / значения Gaea по умолчанию. |
-| **Tint**, **Processing** | Start, End, Hue, Saturation, Lightness; Enhance, Reverse — с диапазонами Gaea. |
+| **Read from Project**, **Reset to Gaea Defaults** | Загрузить значения Tint-нод всех слоёв / значения Gaea по умолчанию. |
+| Подвкладки **Height**, **Flow**, **Wear**, **Sediment** | Для каждого слоя: Start, End, Hue, Saturation, Lightness; Enhance, Reverse — с диапазонами Gaea. |
 
 **Вкладка Gaea Layers**
 
@@ -480,7 +498,7 @@ python tests/test_bridge_logic.py -v
 & "C:\Program Files\Side Effects Software\Houdini XX.X.XXX\bin\hython.exe" tests/test_bridge_logic.py -v
 ```
 
-Ожидаемый результат: `Ran 73 tests ... OK`. Тесты также имитируют `hou.Volume` из
+Ожидаемый результат: `Ran 78 tests ... OK`. Тесты также имитируют `hou.Volume` из
 Houdini 19.5 и проверяют, что исходники разбираются как Python 3.7.
 
 ## Ограничения

@@ -29,6 +29,7 @@ Quick use from a Houdini shelf tool::
 import json
 import os
 import hashlib
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field, asdict
@@ -59,9 +60,12 @@ DEFAULT_OUTPUT_MAPS = {
     "sediment": "output_sediment.exr",
 }
 
-# Color map of the Gaea Tint node: shown on the terrain on request, not imported
-# as a layer.
-DEFAULT_TINT_OUTPUT = "output_tint.exr"
+# Color maps of the Gaea Tint nodes, one per layer: a Tint fed by Erosion2's Out,
+# Flow, Wear or Deposits writes output_tint_<layer>. Shown on the terrain on
+# request (Tint tab), never imported as a layer.
+TINT_LAYERS = ("height", "flow", "wear", "sediment")
+DEFAULT_TINT_OUTPUTS = {layer: "output_tint_{}.exr".format(layer)
+                        for layer in TINT_LAYERS}
 
 # Mask layers (everything but height) are normalized to 0..1 on import, and one of
 # them can be copied into the "mask" layer, which Houdini draws in the viewport and
@@ -116,12 +120,12 @@ class BridgeConfig:
     use_template: bool = False
     erosion_node: str = ""  # Erosion2 node name; "" = the only one in the project
     erosion_params: dict = field(default_factory=dict)
-    # Tint (Tint tab): its Export writes a color map that is only shown on the
-    # terrain (Show Tint), never output as a layer. With use_tint the build copy
-    # gets these Tint values ({Gaea property: value}).
-    tint_output_name: str = DEFAULT_TINT_OUTPUT
+    # Tint (Tint tab): per layer, the Export name of its Tint color map, which is
+    # only shown on the terrain (Show Tint), never output as a layer. With use_tint
+    # the build copy gets these Tint values ({layer: {Gaea property: value}}); the
+    # Tint node of a layer is the one upstream of its Export.
+    tint_outputs: dict = field(default_factory=lambda: dict(DEFAULT_TINT_OUTPUTS))
     use_tint: bool = False
-    tint_node: str = ""  # Tint node name; "" = the only one in the project
     tint_params: dict = field(default_factory=dict)
 
     @property
@@ -371,9 +375,56 @@ def find_output_file(config, layer_name):
     return _find_named_output(config, config.output_maps[layer_name])
 
 
-def find_tint_file(config):
-    """Path of the Gaea Tint color map, or None."""
-    return _find_named_output(config, config.tint_output_name)
+def find_tint_file(config, layer):
+    """Path of the Gaea Tint color map of ``layer``, or None."""
+    name = config.tint_outputs.get(layer)
+    return _find_named_output(config, name) if name else None
+
+
+def find_tint_files(config):
+    """{layer: path} of the Tint color maps that exist."""
+    found = {}
+    for layer in config.tint_outputs:
+        path = find_tint_file(config, layer)
+        if path is not None:
+            found[layer] = path
+    return found
+
+
+TINT_DISPLAY_SUBDIR = "tint_display"
+
+
+def tint_display_path(config, layer, source):
+    """The Tint map of ``layer`` under a name unique to this build, for display.
+
+    Gaea rewrites output_tint_<layer>.exr under the same name, and Houdini's
+    viewport keeps showing the texture it loaded for a path. So the display uses
+    <Bridge Dir>/tint_display/tint_<layer>_<build stamp>.exr: a hard link to the
+    output (no copy, no extra space), or a copy where links are not possible.
+    Older maps of the layer are removed (if Windows still holds one open, it is
+    left for next time). Falls back to ``source`` on any error.
+    """
+    try:
+        info = os.stat(source)
+        folder = os.path.join(config.bridge_dir, TINT_DISPLAY_SUBDIR)
+        os.makedirs(folder, exist_ok=True)
+        prefix = "tint_{}_".format(layer)
+        name = "{}{}_{}.exr".format(prefix, info.st_mtime_ns, info.st_size)
+        target = os.path.join(folder, name)
+        if not os.path.isfile(target):
+            try:
+                os.link(source, target)
+            except OSError:
+                shutil.copyfile(source, target)
+        for old in os.listdir(folder):
+            if old.startswith(prefix) and old != name:
+                try:
+                    os.remove(os.path.join(folder, old))
+                except OSError:
+                    pass
+        return target
+    except OSError:
+        return source
 
 
 def _find_named_output(config, filename):
@@ -585,9 +636,12 @@ def choose_mask_layer(ranges, preferred="auto"):
 
 def _bridge_export_name(config, export):
     """Which bridge output a Gaea Export node writes ("height", "flow", ... or
-    "tint"), matched on its name ignoring case and spaces; None for other exports."""
+    "tint_height", "tint_flow", ...), matched on its name ignoring case and
+    spaces; None for other exports."""
     name = str(export.get("Name", "")).strip().casefold()
-    names = dict(config.output_maps, tint=config.tint_output_name)
+    names = dict(config.output_maps)
+    names.update(("tint_" + layer, filename)
+                 for layer, filename in config.tint_outputs.items())
     for key, filename in names.items():
         if os.path.splitext(filename)[0].strip().casefold() == name:
             return key
@@ -644,9 +698,10 @@ def check_project_paths(config, fix_mask_paths=False):
         if node.get("Format", "EXR") != "EXR":
             problems.append("Export node {!r} should use Format EXR (is {}).".format(
                 name, node.get("Format")))
-    if config.use_tint and "tint" not in matched:
-        problems.append("No Export node named {!r} after the Tint node.".format(
-            os.path.splitext(config.tint_output_name)[0]))
+    if config.use_tint and not any(key.startswith("tint_") for key in matched):
+        problems.append("No Tint Export node in the project (name them {}).".format(
+            ", ".join(os.path.splitext(name)[0]
+                      for name in config.tint_outputs.values())))
     if "height" not in matched:
         problems.append("No Export node named {!r} in the project.".format(
             os.path.splitext(config.output_maps.get("height", "output_height"))[0]))
@@ -655,15 +710,16 @@ def check_project_paths(config, fix_mask_paths=False):
 
 def updated_outputs(config, since):
     """Layers whose output file was (re)written at or after ``since`` (epoch s);
-    "tint" is listed last when the Tint map was written."""
+    rewritten Tint maps follow as "tint_<layer>"."""
     layers = []
     for layer in config.output_maps:
         path = find_output_file(config, layer)
         if path is not None and os.path.getmtime(path) >= since - 1.0:
             layers.append(layer)
-    tint = find_tint_file(config)
-    if layers and tint is not None and os.path.getmtime(tint) >= since - 1.0:
-        layers.append("tint")
+    if layers:
+        for layer, path in find_tint_files(config).items():
+            if os.path.getmtime(path) >= since - 1.0:
+                layers.append("tint_" + layer)
     return layers
 
 
@@ -848,8 +904,56 @@ def find_erosion_node(data, node_name=""):
     return find_gaea_node(data, "Erosion2", node_name, "Erosion Node")
 
 
-def find_tint_node(data, node_name=""):
-    return find_gaea_node(data, "Tint", node_name, "Tint Node")
+def _port_sources(node):
+    """[(port name, source node id)] of a Gaea node's connected input ports."""
+    ports = node.get("Ports")
+    if isinstance(ports, dict):
+        ports = ports.get("$values")
+    sources = []
+    for port in ports if isinstance(ports, list) else ():
+        record = port.get("Record") if isinstance(port, dict) else None
+        if isinstance(record, dict) and record.get("From") is not None:
+            sources.append((str(port.get("Name", "")), record.get("From")))
+    return sources
+
+
+def _nodes_by_id(data):
+    nodes = {}
+
+    def walk(value):
+        if isinstance(value, dict):
+            if "Id" in value and ".Nodes." in str(value.get("$type", "")):
+                nodes[value["Id"]] = value
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(data)
+    return nodes
+
+
+def tint_nodes(data, config):
+    """{layer: Tint node dict} of a parsed .terrain: for each Export named like
+    ``config.tint_outputs[layer]``, the nearest Tint upstream of it (through the
+    "In" ports). Layers without such an Export or Tint are left out."""
+    by_id = _nodes_by_id(data)
+    found = {}
+    for export in _collect_nodes(data, "Export", []):
+        key = _bridge_export_name(config, export)
+        if not key or not key.startswith("tint_"):
+            continue
+        node, seen = export, set()
+        while node is not None and id(node) not in seen:
+            seen.add(id(node))
+            sources = dict(_port_sources(node))
+            source = by_id.get(sources.get("In"))
+            if source is not None and ".Nodes.Tint," in str(source.get("$type", "")):
+                found[key[len("tint_"):]] = source
+                break
+            node = source
+    return found
 
 
 def read_node_params(node, specs):
@@ -886,9 +990,10 @@ def apply_node_params(node, specs, values):
     return changed
 
 
-def read_tint_params(path, node_name=""):
-    return read_node_params(find_tint_node(_load_project(path), node_name),
-                            TINT_PARAMS)
+def read_tint_params(path, config):
+    """{layer: Tint values} of the project's per-layer Tint nodes."""
+    return {layer: read_node_params(node, TINT_PARAMS)
+            for layer, node in tint_nodes(_load_project(path), config).items()}
 
 
 def _load_project(path):
@@ -921,8 +1026,10 @@ def write_template_copy(config, destination):
         changed += apply_node_params(find_erosion_node(data, config.erosion_node),
                                      EROSION2_PARAMS, config.erosion_params)
     if config.use_tint:
-        changed += ["Tint " + name for name in apply_node_params(
-            find_tint_node(data, config.tint_node), TINT_PARAMS, config.tint_params)]
+        nodes = tint_nodes(data, config)
+        for layer in sorted(nodes):
+            changed += ["Tint {} {}".format(layer, name) for name in apply_node_params(
+                nodes[layer], TINT_PARAMS, config.tint_params.get(layer) or {})]
     for mask in mask_file_nodes(data):
         if not _same_path(mask.get("FileName", ""), config.mask_input_path):
             mask["FileName"] = os.path.normpath(config.mask_input_path)
@@ -969,9 +1076,10 @@ def build_settings(config):
         settings["template"] = {"node": config.erosion_node,
                                 "params": dict(config.erosion_params)}
     if config.use_tint:
-        settings["tint"] = {"node": config.tint_node, "params": {
-            name: _to_gaea(TINT_TYPES[name], value)
-            for name, value in config.tint_params.items() if name in TINT_TYPES}}
+        settings["tint"] = {
+            layer: {name: _to_gaea(TINT_TYPES[name], value)
+                    for name, value in (values or {}).items() if name in TINT_TYPES}
+            for layer, values in config.tint_params.items()}
     return settings
 
 
@@ -991,8 +1099,10 @@ def validate_build(config):
             data = _load_project(config.gaea_project)
             if config.use_template:
                 find_erosion_node(data, config.erosion_node)
-            if config.use_tint:
-                find_tint_node(data, config.tint_node)
+            if config.use_tint and not tint_nodes(data, config):
+                problems.append("No Tint node feeds the Tint Export nodes ({}).".format(
+                    ", ".join(os.path.splitext(name)[0]
+                              for name in config.tint_outputs.values())))
         except (ValueError, OSError) as error:
             problems.append(str(error))
     return problems
@@ -1745,7 +1855,6 @@ def overrides_from_node(node):
         "erosion_node": _eval("erosion_node", None, as_string=True),
         "erosion_params": _erosion_params_from_node(node) or None,
         "use_tint": _bool_or_none(_eval("use_tint", None)),
-        "tint_node": _eval("tint_node", None, as_string=True),
         "tint_params": _tint_params_from_node(node) or None,
     }
 
@@ -1804,50 +1913,63 @@ def on_template_toggled(node):
 TINT_PARM_PREFIX = "tint_"
 
 
+def tint_parm_name(layer, name):
+    """HDA parameter of a layer's Tint value, e.g. tint_flow_Start."""
+    return "{}{}_{}".format(TINT_PARM_PREFIX, layer, name)
+
+
 def _tint_params_from_node(node):
-    """{Gaea property: value} from the node's tint_* parameters."""
-    values = {}
-    for name, _, _, kind, _, _, _ in TINT_PARAMS:
-        parm_name = TINT_PARM_PREFIX + name
-        if kind == "color":
-            parm = node.parmTuple(parm_name)
-            if parm is not None:
-                values[name] = _coerce_kind(kind, parm.eval())
-        else:
-            parm = node.parm(parm_name)
-            if parm is not None:
-                values[name] = _coerce_kind(
-                    kind, parm.evalAsString() if kind == "enum" else parm.eval())
-    return values
+    """{layer: {Gaea property: value}} from the node's tint_<layer>_* parameters."""
+    params = {}
+    for layer in TINT_LAYERS:
+        values = {}
+        for name, _, _, kind, _, _, _ in TINT_PARAMS:
+            parm_name = tint_parm_name(layer, name)
+            if kind == "color":
+                parm = node.parmTuple(parm_name)
+                if parm is not None:
+                    values[name] = _coerce_kind(kind, parm.eval())
+            else:
+                parm = node.parm(parm_name)
+                if parm is not None:
+                    values[name] = _coerce_kind(
+                        kind, parm.evalAsString() if kind == "enum" else parm.eval())
+        if values:
+            params[layer] = values
+    return params
 
 
 def read_tint_into_node(node, defaults=False):
-    """Fill the node's Tint parameters from the project (or Gaea's defaults)."""
+    """Fill the node's per-layer Tint parameters from the project's Tint nodes
+    (or with Gaea's defaults)."""
     if defaults:
-        values = {name: _coerce_kind(TINT_TYPES[name], value)
-                  for name, value in TINT_DEFAULTS.items()}
+        defaults_values = {name: _coerce_kind(TINT_TYPES[name], value)
+                           for name, value in TINT_DEFAULTS.items()}
+        per_layer = {layer: defaults_values for layer in TINT_LAYERS}
         source = "Gaea defaults"
     else:
         config = config_from_node(node)
         if not config.gaea_project or not os.path.isfile(config.gaea_project):
-            message = "Set Gaea Project on the Paths tab to read the Tint node."
+            message = "Set Gaea Project on the Paths tab to read the Tint nodes."
             _set_status(node, message)
             return message
-        values = read_tint_params(config.gaea_project, config.tint_node)
+        per_layer = read_tint_params(config.gaea_project, config)
         source = os.path.basename(config.gaea_project)
-    for name, value in values.items():
-        kind = TINT_TYPES[name]
-        if kind == "color":
-            parm = node.parmTuple(TINT_PARM_PREFIX + name)
-        else:
-            parm = node.parm(TINT_PARM_PREFIX + name)
-        if parm is None:
-            continue
-        if kind == "bool":
-            value = int(value)
-        parm.set(value)
+    for layer, values in per_layer.items():
+        for name, value in values.items():
+            kind = TINT_TYPES[name]
+            parm_name = tint_parm_name(layer, name)
+            parm = node.parmTuple(parm_name) if kind == "color" else node.parm(parm_name)
+            if parm is None:
+                continue
+            parm.set(int(value) if kind == "bool" else value)
     _set_parm_if_present(node, "_tint_loaded", 1)
-    message = "Tint parameters loaded from {}.".format(source)
+    if not per_layer:
+        message = ("No Tint nodes found in {} (a Tint feeding an Export named "
+                   "output_tint_height/flow/wear/sediment).".format(source))
+    else:
+        message = "Tint parameters ({}) loaded from {}.".format(
+            ", ".join(layer for layer in TINT_LAYERS if layer in per_layer), source)
     _set_status(node, message)
     return message
 
@@ -1861,6 +1983,72 @@ def on_tint_toggled(node):
             message = "Could not read the Tint node: {}".format(error)
             _set_status(node, message)
             return message
+    return None
+
+
+def _tint_layer(node):
+    parm = node.parm("tint_layer")
+    return parm.evalAsString() if parm is not None else TINT_LAYERS[0]
+
+
+def refresh_viewport():
+    """Redraw the scene viewers. Never runs "glcache -c": the viewport draws
+    HeightFields from textures too, and an unchanged terrain isn't uploaded again,
+    so it vanishes. New tint maps get new file names instead (tint_display_path)."""
+    import hou
+
+    if not hou.isUIAvailable():
+        return
+    try:
+        for pane in hou.ui.paneTabs():
+            if pane.type() == hou.paneTabType.SceneViewer:
+                for viewport in pane.viewports():
+                    viewport.draw()
+    except Exception:  # noqa: BLE001 - a redraw is only a nicety
+        pass
+
+
+def show_tint(node, show):
+    """Show (or hide) the Tint Layer's color map on the Terrain output.
+
+    The map must have been built and imported. Its display material is cooked
+    before it is switched in, then the viewport reloads its textures. Returns
+    the status message.
+    """
+    layer = _tint_layer(node)
+    path = ""
+    if show:
+        parm = node.parm("_tint_file_" + layer)
+        path = parm.eval() if parm is not None else ""
+        if not node.evalParm("_imported") or not path or not os.path.isfile(path):
+            _set_parm_if_present(node, "show_tint", 0)
+            node.cook(force=True)
+            refresh_viewport()
+            message = ("No {0} tint map imported: build and import with an Export "
+                       "named output_tint_{0} after its Tint node.".format(layer))
+            _set_status(node, message)
+            return message
+        shade = node.node("tint_display_" + layer)
+        if shade is not None:
+            shade.cook(force=True)  # creates its material before it is shown
+    _set_parm_if_present(node, "show_tint", int(bool(show)))
+    node.cook(force=True)
+    refresh_viewport()
+    message = ("Tint shown: {} ({}).".format(layer, os.path.basename(path).strip())
+               if show else "Tint hidden.")
+    _set_status(node, message)
+    return message
+
+
+def toggle_tint(node):
+    """Toggle Tint button: show the Tint Layer's tint, or hide the shown one."""
+    return show_tint(node, not node.evalParm("show_tint"))
+
+
+def on_tint_layer_changed(node):
+    """Another Tint Layer while a tint is shown: show that one instead."""
+    if node.evalParm("show_tint"):
+        return show_tint(node, True)
     return None
 
 
@@ -1890,7 +2078,7 @@ def export_from_node(node, use_cache=True):
     """Export the HDA node's first input (terrain) and second input (mask)."""
     source = node_input(node, 0)
     if source is None:
-        raise RuntimeError("Connect a HeightField into the Gaea Erosion Bridge input.")
+        raise RuntimeError("Connect a HeightField into the Gaea Erosion2 Bridge input.")
     return export_for_gaea(source, config_from_node(node), use_cache=use_cache,
                            mask_node=node_input(node, 1))
 
@@ -1928,7 +2116,7 @@ def import_into_node(node, config=None, set_display=True):
 
     if node.parm("_imported") is None:
         raise RuntimeError(
-            "{} is not an up-to-date Gaea Erosion Bridge node. Rebuild the HDA "
+            "{} is not an up-to-date Gaea Erosion2 Bridge node. Rebuild the HDA "
             "(build_gaea_bridge_hda.py).".format(node.path())
         )
     config = config or config_from_node(node)
@@ -1947,7 +2135,7 @@ def import_into_node(node, config=None, set_display=True):
         )
     stamp = output_stamp(config)
 
-    with hou.undos.group("Gaea Erosion Bridge: import"):
+    with hou.undos.group("Gaea Erosion2 Bridge: import"):
         _set_parm_if_present(node, "_import_stamp", stamp)
         for layer in layers:
             node.parm("_{}_file".format(layer)).set(found[layer] or "")
@@ -1956,12 +2144,13 @@ def import_into_node(node, config=None, set_display=True):
         node.parm("_enc_span").set(float(encoding.get("span", 0.0)))
         node.parm("_enc_offset").set(float(encoding.get("offset", 0.0)))
         node.parm("_houdini_width").set(float(manifest.get("houdini_width") or 0.0))
-        tint = find_tint_file(config)
-        _set_parm_if_present(node, "_tint_file", tint or "")
+        tint = find_tint_files(config)
+        for layer in TINT_LAYERS:
+            # A per-build file name, so the viewport loads the new map by itself.
+            _set_parm_if_present(node, "_tint_file_" + layer,
+                                 tint_display_path(config, layer, tint[layer])
+                                 if layer in tint else "")
         node.parm("_imported").set(1)
-        if tint and hou.isUIAvailable():
-            # Same file name, new content: make the viewport reload the texture.
-            hou.hscript("glcache -c")
 
         # Same path as last time -> make the file nodes re-read the new build.
         for layer in layers:
@@ -1992,7 +2181,8 @@ def import_into_node(node, config=None, set_display=True):
         imported, skipped, peaks, "", bool(encoding.get("span"))
     )
     if tint:
-        message += "  Tint map loaded (Tint tab > Show Tint on Terrain)."
+        message += "  Tint maps loaded: {} (Tint tab > Toggle Tint).".format(
+            ", ".join(layer for layer in TINT_LAYERS if layer in tint))
     if removed:
         message += "  Removed old import nodes: {}.".format(", ".join(removed))
     return {"node": node, "imported": imported, "skipped": skipped,
@@ -2011,7 +2201,9 @@ def clear_node_import(node):
     _set_parm_if_present(node, "_import_stamp", "")
     for layer in ("height",) + MASK_LAYERS:
         node.parm("_{}_file".format(layer)).set("")
-    _set_parm_if_present(node, "_tint_file", "")
+    for layer in TINT_LAYERS:
+        _set_parm_if_present(node, "_tint_file_" + layer, "")
+    _set_parm_if_present(node, "show_tint", 0)
 
 
 # --------------------------------------------------------------------------- #

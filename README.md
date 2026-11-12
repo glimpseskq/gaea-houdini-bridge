@@ -85,7 +85,7 @@ exec(open(r"C:/path/to/BridgeHGH/build_gaea_bridge_hda.py").read())
 ```
 
 The console prints `Installed HDA: ...\otls\gaea_erosion_bridge.hda`, and a
-**Gaea Erosion Bridge** node appears in the SOP **Tab** menu.
+**Gaea Erosion2 Bridge** node appears in the SOP **Tab** menu.
 
 The HDA is installed into your user `otls` folder. To remove the asset, delete
 `gaea_erosion_bridge.hda` from that folder. After updating the repository, run the build
@@ -96,7 +96,7 @@ again (and reload the module or restart Houdini); existing nodes pick up the new
 ### In Houdini: export
 
 1. Build a terrain, for example `heightfield` ▸ `heightfield_noise`.
-2. Create a **Gaea Erosion Bridge** node and connect the HeightField to its first input.
+2. Create a **Gaea Erosion2 Bridge** node and connect the HeightField to its first input.
    Optionally connect a mask to the second input (see [Mask input](#mask-input)).
 3. On the **Paths** tab, set **Bridge Dir** (default: `C:/Temp/gh_bridge`) and
    **Gaea Project** (`.terrain`; the bridge reads the Gaea world size from it). For the
@@ -154,7 +154,7 @@ without it a build refuses to start, with the reason in Status, if the path is w
 | Flow      | `output_flow`     | `flow`     |
 | Wear      | `output_wear`     | `wear`     |
 | Deposits  | `output_sediment` | `sediment` |
-| Tint (color node) | `output_tint` | shown on the terrain, not a layer (see [Tint](#tint)) |
+| Out / Flow / Wear / Deposits → Tint | `output_tint_height` / `_flow` / `_wear` / `_sediment` | shown on the terrain, not a layer (see [Tint](#tint)) |
 
 You don't have to wire up every output: the bridge imports whatever it finds. File names
 are matched ignoring case and leading/trailing spaces.
@@ -221,28 +221,45 @@ can serve many Houdini scenes with different settings.
 
 ### Tint
 
-A Gaea **Tint** node (for example on Erosion2's Out) with an Export node named
-`output_tint` produces a color map of the terrain. It is built together with everything
-else on every build and loaded by the import, but it is never an output or a layer of the
-node: it is only shown on the terrain, when **Show Tint on Terrain** is on (Tint tab).
-The display is a HeightField Quick Shade material with the color map as base texture, on
-the Terrain output; the Terrain geometry itself stays the same.
+Each layer can have its own color map: a Gaea **Tint** node on one of Erosion2's outputs,
+followed by an Export node named after the layer:
 
-The **Tint** tab works like the Erosion tab: turn on **Use Tint Parameters** and all Tint
-values appear, read from the project (Start and End colors, Hue, Saturation, Lightness,
-Enhance None/Autolevel/Equalize, Reverse). They go into the same build copy as the
-Erosion values; the project itself is not changed. **Read from Project** /
-**Reset to Gaea Defaults** reload the values, **Tint Node** picks the node if there are
-several. The values are part of the cache, and **Auto Build on Change** reacts to them too.
+```
+Erosion2 Out      -> Tint -> output_tint_height
+Erosion2 Flow     -> Tint -> output_tint_flow
+Erosion2 Wear     -> Tint -> output_tint_wear
+Erosion2 Deposits -> Tint -> output_tint_sediment
+```
 
-Build copies also set the bridge's Export nodes (`output_*`, including `output_tint`) to
-Location Custom, Output Path `<Bridge Dir>/output`, Format EXR, so a new Export node only
-needs the right name.
+The Tint nodes can all keep Gaea's default name "Tint": the bridge finds each one by
+following its Export node upstream. You don't need all four.
+
+The tints are built together with everything else on every build and loaded by the
+import, but they are never outputs or layers of the node. They are only shown on the
+terrain: pick the tint in **Tint Layer** (Height, Flow, Wear, Sediment) on the Tint tab
+and press **Toggle Tint** to show it; press it again to hide it. Picking another layer
+while a tint is shown shows that one instead. The display is a HeightField Quick
+Shade material with the color map as base texture, on the Terrain output; the Terrain
+geometry itself stays the same. Each import shows the maps under build-specific names in
+`<Bridge Dir>/tint_display` (hard links to the outputs, older ones removed), so a rebuilt
+tint appears without clearing the viewport's texture cache.
+
+The **Tint** tab works like the Erosion tab: turn on **Use Tint Parameters** and a
+sub-tab per layer appears with all values of that layer's Tint node, read from the
+project (Start and End colors, Hue, Saturation, Lightness, Enhance None/Autolevel/Equalize,
+Reverse). They go into the same build copy as the Erosion values; the project itself is
+not changed. **Read from Project** / **Reset to Gaea Defaults** reload the values of all
+layers. Values of a layer without a Tint node are ignored. The values are part of the
+cache, and **Auto Build on Change** reacts to them too.
+
+Build copies also set the bridge's Export nodes (`output_*`, including `output_tint_*`)
+to Location Custom, Output Path `<Bridge Dir>/output`, Format EXR, so a new Export node
+only needs the right name.
 
 ### In Houdini: import
 
 Press **3. Import Results** (or let **Build in Gaea** / **Auto Import** do it). From then
-on the **Gaea Erosion Bridge** node itself outputs the result (no extra nodes are created
+on the **Gaea Erosion2 Bridge** node itself outputs the result (no extra nodes are created
 in your network) on four outputs:
 
 | Output | Contents |
@@ -311,11 +328,12 @@ It pauses while a **Build in Gaea** is running, since that build imports by itse
 
 | Parameter | What it does |
 |-----------|--------------|
-| **Show Tint on Terrain** | Show Gaea's Tint color map on the Terrain output (display material only). |
+| **Tint Layer** | Which tint to show: Height, Flow, Wear or Sediment (`output_tint_<layer>`). Switching it while a tint is shown shows the new one. |
+| **Toggle Tint** | Show the Tint Layer's color map on the Terrain output (display material only); press again to hide it. Status says which tint is shown or why it can't be. |
 | **Export > Build > Import**, **Status** | Same as on the Bridge tab. |
 | **Use Tint Parameters** | Build with the Tint values below (see [Tint](#tint)). The rest of the tab is shown only when this is on. |
-| **Tint Node**, **Read from Project**, **Reset to Gaea Defaults** | Which Tint node to drive; load its values / Gaea's defaults. |
-| **Tint**, **Processing** | Start, End, Hue, Saturation, Lightness; Enhance, Reverse — with Gaea's ranges. |
+| **Read from Project**, **Reset to Gaea Defaults** | Load the values of every layer's Tint node / Gaea's defaults. |
+| **Height**, **Flow**, **Wear**, **Sediment** sub-tabs | Per layer: Start, End, Hue, Saturation, Lightness; Enhance, Reverse — with Gaea's ranges. |
 
 **Gaea Layers tab**
 
@@ -483,7 +501,7 @@ or with `hython` from your Houdini install if you have no standalone Python:
 & "C:\Program Files\Side Effects Software\Houdini XX.X.XXX\bin\hython.exe" tests/test_bridge_logic.py -v
 ```
 
-Expected result: `Ran 73 tests ... OK`. The tests also simulate Houdini 19.5's
+Expected result: `Ran 78 tests ... OK`. The tests also simulate Houdini 19.5's
 `hou.Volume` and check that the sources parse as Python 3.7.
 
 ## Limitations
