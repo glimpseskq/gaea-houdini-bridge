@@ -37,8 +37,11 @@ import hou
 import houdini_gaea_bridge as ghb
 
 
+# The type name stays "gaea_erosion_bridge" so nodes in saved scenes keep their
+# definition; the TAB menu label and new node names say Erosion2, like in Gaea.
 ASSET_TYPE_NAME = "gaea_erosion_bridge"
-ASSET_LABEL = "Gaea Erosion Bridge"
+ASSET_LABEL = "Gaea Erosion2 Bridge"
+NODE_NAME = "gaea_erosion2_bridge"
 
 MASK_LAYERS = ("flow", "wear", "sediment")
 
@@ -47,16 +50,9 @@ MASK_LAYERS = ("flow", "wear", "sediment")
 # namespace (they cannot see the HDA's PythonModule directly), so all logic lives
 # in houdini_gaea_bridge and the callbacks only call into it.
 EXPORT_CALLBACK = r"""
-import hou
 import houdini_gaea_bridge as ghb
 node = kwargs['node']
-cfg = ghb.config_from_node(node)
-# Operate on the node feeding input 0:
-src = node.inputs()[0] if node.inputs() else None
-if src is None:
-    raise hou.NodeError('Connect a HeightField into the Gaea Erosion Bridge input.')
-res = ghb.export_for_gaea(src, cfg)
-ghb.set_status(node, res['message'])
+ghb.set_status(node, ghb.export_from_node(node)['message'])
 """.strip()
 
 IMPORT_CALLBACK = r"""
@@ -91,8 +87,21 @@ try:
     ghb.unlock_after_load(kwargs['node'])
     ghb.sync_auto_import(kwargs['node'])
 except Exception as error:
-    print('Gaea Erosion Bridge: could not resume Auto Import: {}'.format(error))
+    print('Gaea Erosion2 Bridge: could not resume Auto Import: {}'.format(error))
 """.strip()
+
+# New nodes are named gaea_erosion2_bridge1, 2, ... (Houdini names them after the
+# type, gaea_erosion_bridge1); renamed nodes are left alone.
+ON_CREATED_SCRIPT = r"""
+import re
+node = kwargs['node']
+match = re.match(r'^gaea_erosion_bridge(\d*)$', node.name())
+if match:
+    try:
+        node.setName('%s' + (match.group(1) or '1'), unique_name=True)
+    except Exception:
+        pass
+""".strip() % NODE_NAME
 
 ON_DELETED_SCRIPT = r"""
 try:
@@ -137,6 +146,31 @@ import houdini_gaea_bridge as ghb
 ghb.read_template_into_node(kwargs['node'], defaults=True)
 """.strip()
 
+TINT_TOGGLE_CALLBACK = r"""
+import houdini_gaea_bridge as ghb
+ghb.on_tint_toggled(kwargs['node'])
+""".strip()
+
+LOAD_SHADE_CALLBACK = r"""
+import houdini_gaea_bridge as ghb
+ghb.load_quick_shade(kwargs['node'])
+""".strip()
+
+RESET_SHADE_CALLBACK = r"""
+import houdini_gaea_bridge as ghb
+ghb.reset_quick_shade(kwargs['node'])
+""".strip()
+
+READ_TINT_CALLBACK = r"""
+import houdini_gaea_bridge as ghb
+ghb.read_tint_into_node(kwargs['node'])
+""".strip()
+
+RESET_TINT_CALLBACK = r"""
+import houdini_gaea_bridge as ghb
+ghb.read_tint_into_node(kwargs['node'], defaults=True)
+""".strip()
+
 OPEN_CALLBACK = r"""
 import houdini_gaea_bridge as ghb
 ghb.open_in_gaea(ghb.config_from_node(kwargs['node']))
@@ -162,7 +196,7 @@ HEIGHT_FROM_GAEA_EXPR = 'strlen(chs("../_height_file")) > 0 && ch("../height_sou
 def _process_vex():
     """Per-voxel processing of the imported layers (runs in a Volume Wrangle)."""
     lines = [
-        "// Gaea Erosion Bridge: driven by the asset's parameters.",
+        "// Gaea Erosion2 Bridge: driven by the asset's parameters.",
         "",
         "// Height: Gaea 0..1 -> Houdini units, only when the height comes from Gaea.",
         'if (chi("../height_source") == 0 && strlen(chs("../_height_file")) > 0'
@@ -314,6 +348,26 @@ def _build_network(subnet):
         _setp(on_input_grid, "layer", "*")
         result = _switch(subnet, name.lower() + "_grid_switch",
                          (result, on_input_grid), 'ch("../keep_input_res")')
+        if index == 0:
+            # Load Tint: the chosen layer's Tint map, converted to luminance, goes
+            # into the Terrain output's "mask" layer and is drawn like Show Mask
+            # (a layer change the viewport always follows). No extra layer.
+            # show_tint: 0 = none, 1..4 = TINT_LAYERS (set by Load Tint / Reset).
+            tint_file = ('chs("../_tint_file_" + arg("{}", max(ch("../show_tint") - 1, 0)))'
+                         .format(" ".join(ghb.TINT_LAYERS)))
+            tint = subnet.createNode("heightfield_file", "tint_to_mask")
+            tint.setInput(0, result)
+            _setp(tint, ("filename", "file"), tint_file, expression=True)
+            _setp(tint, "monoop", "lum", required=False)  # color -> luminance
+            _setp(tint, "type", "mask")
+            _setp(tint, ("layer", "layername"), "mask")
+            _setp(tint, "layermode", "replace", required=False)
+            _setp(tint, "doclampmin", 0, required=False)
+            _setp(tint, "doclampmax", 0, required=False)
+            result = _switch(
+                subnet, "tint_display_switch", (result, tint),
+                'ch("../_imported") && ch("../show_tint") > 0 && '
+                'strlen({}) > 0'.format(tint_file))
         out = subnet.createNode("output", name)
         out.setInput(0, result)
         _setp(out, "outputidx", index)
@@ -476,6 +530,101 @@ def _erosion_tab():
     return tab
 
 
+def _tint_parm(layer, name, label, kind, default, low, high):
+    parm_name = ghb.tint_parm_name(layer, name)
+    help_text = "Gaea Tint '{}' of the {} tint (default {}).".format(
+        name, layer, default)
+    callback = dict(script_callback=EROSION_CHANGED_CALLBACK,
+                    script_callback_language=hou.scriptLanguage.Python)
+    if kind == "color":
+        template = hou.FloatParmTemplate(
+            parm_name, label, 3, default_value=tuple(default), min=0.0, max=1.0,
+            min_is_strict=True, max_is_strict=True,
+            naming_scheme=hou.parmNamingScheme.RGBA, help=help_text, **callback)
+        template.setLook(hou.parmLook.ColorSquare)
+        return template
+    if kind == "enum":
+        return hou.MenuParmTemplate(parm_name, label, low, menu_labels=low,
+                                    default_value=list(low).index(default),
+                                    help=help_text, **callback)
+    if kind == "bool":
+        return hou.ToggleParmTemplate(parm_name, label, default_value=bool(default),
+                                      help=help_text, **callback)
+    return hou.FloatParmTemplate(parm_name, label, 1, default_value=(float(default),),
+                                 min=low, max=high, min_is_strict=True,
+                                 max_is_strict=True, help=help_text, **callback)
+
+
+def _tint_tab():
+    """Per-layer Gaea Tint parameters and the tint display."""
+    tab = hou.FolderParmTemplate("tint_tab", "Tint", folder_type=hou.folderType.Tabs)
+    # Pick a tint (or None), press Load Tint. The display state is the hidden
+    # show_tint parameter, set only by the two buttons.
+    layer_menu = hou.MenuParmTemplate(
+        "tint_layer", "Tint", ghb.TINT_MENU,
+        menu_labels=tuple(item.capitalize() for item in ghb.TINT_MENU),
+        default_value=0,
+        help="Which tint Load Tint shows: None, or the Tint node fed by "
+             "Erosion2's Out (Height), Flow, Wear or Deposits (Sediment), exported "
+             "as output_tint_<layer>.")
+    layer_menu.setJoinWithNext(True)
+    tab.addParmTemplate(layer_menu)
+    load = _button(
+        "load_shade", "Load Tint", LOAD_SHADE_CALLBACK,
+        "Show the tint chosen in the menu on the Terrain output as its mask "
+        "(luminance of the Tint map, drawn like Show Mask); None hides it. Every "
+        "press re-reads the map, so pressing it again reloads the tint. The maps "
+        "are built with every Gaea build.")
+    load.setJoinWithNext(True)
+    tab.addParmTemplate(load)
+    tab.addParmTemplate(_button(
+        "reset_shade", "Reset", RESET_SHADE_CALLBACK,
+        "Take the tint off the terrain."))
+    tab.addParmTemplate(_button(
+        "run_cycle_tint", "Export > Build > Import", CYCLE_CALLBACK,
+        "Same as on the Bridge tab: build in Gaea (erosion and tint) and import."))
+    tab.addParmTemplate(_status_parm("_status_tint"))
+    tab.addParmTemplate(hou.ToggleParmTemplate(
+        "use_tint", "Use Tint Parameters", default_value=False,
+        script_callback=TINT_TOGGLE_CALLBACK,
+        script_callback_language=hou.scriptLanguage.Python,
+        help="Build a copy of the Gaea project with the Tint values below (the "
+             "project itself is not changed), like Use Erosion Template does for "
+             "Erosion2. Each layer tab drives the Tint node that feeds its "
+             "output_tint_<layer> Export. Off: Gaea uses the Tint values saved in "
+             "the project."))
+    hidden = "{ use_tint == 0 }"
+    for name, label, callback, help_text in (
+            ("read_tint", "Read from Project", READ_TINT_CALLBACK,
+             "Load the values of every Tint node saved in the Gaea project."),
+            ("reset_tint", "Reset to Gaea Defaults", RESET_TINT_CALLBACK,
+             "Set every Tint value of every layer to Gaea's default.")):
+        button = _button(name, label, callback, help_text)
+        button.setConditional(hou.parmCondType.HideWhen, hidden)
+        tab.addParmTemplate(button)
+    # One sub-tab per layer (Height | Flow | Wear | Sediment), each with the full
+    # Tint parameter set of its Tint node.
+    for layer in ghb.TINT_LAYERS:
+        layer_tab = hou.FolderParmTemplate(
+            "tint_{}_tab".format(layer), layer.capitalize(),
+            folder_type=hou.folderType.Tabs)
+        layer_tab.setConditional(hou.parmCondType.HideWhen, hidden)
+        folders = {}
+        for name, label, group, kind, default, low, high in ghb.TINT_PARAMS:
+            folder = folders.get(group)
+            if folder is None:
+                folder = hou.FolderParmTemplate(
+                    "tint_{}_{}".format(layer, group.lower().replace(" ", "_")),
+                    group, folder_type=hou.folderType.Simple)
+                folders[group] = folder
+            folder.addParmTemplate(
+                _tint_parm(layer, name, label, kind, default, low, high))
+        for folder in folders.values():
+            layer_tab.addParmTemplate(folder)
+        tab.addParmTemplate(layer_tab)
+    return tab
+
+
 def _build_parm_template_group():
     g = hou.ParmTemplateGroup()
 
@@ -487,6 +636,17 @@ def _build_parm_template_group():
         menu_labels=("Full", "1/2", "1/3", "1/4"), default_value=0,
         help="Export resolution relative to the input HeightField. The terrain keeps "
              "its size; only the pixel count drops (1/2 = half the voxels per axis)."))
+    mask_layer = hou.StringParmTemplate(
+        "mask_input_layer", "Mask Input Layer", 1, default_value=("auto",),
+        menu_items=("auto", "mask", "height"),
+        menu_labels=("Auto", "mask", "height"),
+        menu_type=hou.menuType.StringReplace,
+        help="Which layer of the second input (Mask) goes to Gaea. Auto: 'mask' if "
+             "it has values, else 'height' stretched to 0..1 (a noise HeightField "
+             "works as a mask), else the only volume. Plain geometry (no volumes) "
+             "becomes a mask with Mask by Object. Without a second input the mask "
+             "is white everywhere.")
+    bridge.addParmTemplate(mask_layer)
     bridge.addParmTemplate(_button(
         "run_cycle", "Export > Build > Import", CYCLE_CALLBACK,
         "Whole round trip without opening Gaea: export the input, build the Gaea "
@@ -534,6 +694,7 @@ def _build_parm_template_group():
     g.append(bridge)
 
     g.append(_erosion_tab())
+    g.append(_tint_tab())
 
     # --- Layers tab ---------------------------------------------------- #
     layers = hou.FolderParmTemplate("layers_tab", "Gaea Layers",
@@ -595,6 +756,16 @@ def _build_parm_template_group():
                                             default_value=False)))
     g.append(_hidden(hou.StringParmTemplate("_import_stamp", "Import stamp", 1,
                                             default_value=("",))))
+    for layer in ghb.TINT_LAYERS:
+        g.append(_hidden(hou.StringParmTemplate(
+            "_tint_file_" + layer, layer + " tint map", 1, default_value=("",))))
+    g.append(_hidden(hou.ToggleParmTemplate("_tint_loaded", "Tint values loaded",
+                                            default_value=False)))
+    # Tint display state, set only by Load Tint / Reset:
+    # 0 = no tint, 1..4 = ghb.TINT_LAYERS[show_tint - 1].
+    g.append(_hidden(hou.IntParmTemplate("show_tint", "Tint shown", 1,
+                                         default_value=(0,), min=0,
+                                         max=len(ghb.TINT_LAYERS))))
     g.append(_hidden(hou.ToggleParmTemplate("_ero_loaded", "Erosion values loaded",
                                             default_value=False)))
     for layer in ("height",) + MASK_LAYERS:
@@ -650,16 +821,17 @@ def build(install_dir=None):
             hda_file_name=hda_path,
             description=ASSET_LABEL,
             min_num_inputs=1,
-            max_num_inputs=1,
+            max_num_inputs=2,  # 1: terrain, 2: optional mask sent to Gaea
             ignore_external_references=True,
         )
 
         definition = asset.type().definition()
         definition.setParmTemplateGroup(_build_parm_template_group())
         definition.setMaxNumOutputs(1 + len(MASK_LAYERS))
-        _set_io_labels(definition, inputs=("HeightField",),
+        _set_io_labels(definition, inputs=("HeightField", "Mask (optional)"),
                        outputs=("Terrain",) + tuple(l.capitalize() for l in MASK_LAYERS))
-        for section, script in (("OnLoaded", ON_LOADED_SCRIPT),
+        for section, script in (("OnCreated", ON_CREATED_SCRIPT),
+                                ("OnLoaded", ON_LOADED_SCRIPT),
                                 ("OnDeleted", ON_DELETED_SCRIPT)):
             definition.addSection(section, script)
             definition.setExtraFileOption(section + "/IsPython", True)
