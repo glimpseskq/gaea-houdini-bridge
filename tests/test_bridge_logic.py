@@ -649,6 +649,16 @@ class TintTests(unittest.TestCase):
         self.assertEqual(os.path.dirname(second), os.path.join(
             self.cfg.bridge_dir, ghb.TINT_DISPLAY_SUBDIR))
 
+    def test_fresh_display_path_is_always_new(self):
+        source = os.path.join(self.cfg.output_dir, "output_tint_wear.exr")
+        _write(source, b"map")
+        first = ghb.tint_display_path(self.cfg, "wear", source, fresh=True)
+        second = ghb.tint_display_path(self.cfg, "wear", source, fresh=True)
+        self.assertNotEqual(first, second)
+        self.assertFalse(os.path.exists(first))
+        with open(second, "rb") as handle:
+            self.assertEqual(handle.read(), b"map")
+
     def test_rewritten_tints_listed_after_layers(self):
         _write(os.path.join(self.cfg.output_dir, "output_height.exr"))
         _write(os.path.join(self.cfg.output_dir, "output_tint_wear.exr"))

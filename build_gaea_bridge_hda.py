@@ -151,14 +151,14 @@ import houdini_gaea_bridge as ghb
 ghb.on_tint_toggled(kwargs['node'])
 """.strip()
 
-TOGGLE_TINT_CALLBACK = r"""
+LOAD_SHADE_CALLBACK = r"""
 import houdini_gaea_bridge as ghb
-ghb.toggle_tint(kwargs['node'])
+ghb.load_quick_shade(kwargs['node'])
 """.strip()
 
-TINT_LAYER_CALLBACK = r"""
+RESET_SHADE_CALLBACK = r"""
 import houdini_gaea_bridge as ghb
-ghb.on_tint_layer_changed(kwargs['node'])
+ghb.reset_quick_shade(kwargs['node'])
 """.strip()
 
 READ_TINT_CALLBACK = r"""
@@ -349,47 +349,25 @@ def _build_network(subnet):
         result = _switch(subnet, name.lower() + "_grid_switch",
                          (result, on_input_grid), 'ch("../keep_input_res")')
         if index == 0:
-            # Toggle Tint: the Tint color map of the chosen layer (Tint
-            # Layer) as the terrain's base texture (HeightField Quick Shade
-            # material; UVs span the terrain). Only a display material: no layer
-            # is added to the output. One Quick Shade (= one material) per layer,
-            # picked by a switch: the viewport keeps a material's texture cached,
-            # so switching layers swaps materials instead of changing a path.
-            shades = []
-            for layer in ghb.TINT_LAYERS:
-                shade = subnet.createNode("heightfield_quickshade",
-                                          "tint_display_" + layer)
-                shade.setInput(0, result)
-                _setp(shade, "base_map", 'chs("../_tint_file_{}")'.format(layer),
-                      expression=True)
-                _setp(shade, "use_base_map", 1, required=False)
-                _setp(shade, "base_triplanar", 0, required=False)  # UV projection
-                _setp(shade, "base_clamp_uvs", 1, required=False)
-                _setp(shade, "tinting", "none", required=False)  # no red mask tint
-                shades.append(shade)
-            pick = subnet.createNode("switch", "tint_layer_switch")
-            for i, shade in enumerate(shades):
-                pick.setInput(i, shade)
-            _setp(pick, "input", 'ch("../tint_layer")', expression=True)  # menu index
-            # Tint hidden: an explicit empty material instead of no attribute.
-            # When shop_materialpath just disappears, the viewport keeps drawing
-            # the last tint material (the terrain volumes themselves are
-            # unchanged); a changed value makes it drop the material.
-            hidden = subnet.createNode("attribwrangle", "tint_hidden")
-            hidden.setInput(0, result)
-            _setp(hidden, "class", 0)  # detail (only once)
-            _setp(hidden, "snippet",
-                  'if (!hasdetailattrib(0, "shop_materialpath"))\n'
-                  '    adddetailattrib(0, "shop_materialpath", "");\n')
-            display = subnet.createNode("switch", "tint_display_switch")
-            for i, src in enumerate((result, hidden, pick)):
-                display.setInput(i, src)
-            # 0: not imported (input as is), 1: tint hidden, 2: tint shown
-            _setp(display, "input",
-                  'if(ch("../_imported"), if(ch("../show_tint") && '
-                  'strlen(chs("../_tint_file_" + chs("../tint_layer"))) > 0, 2, 1), 0)',
-                  expression=True)
-            result = display
+            # Load Tint: the chosen layer's Tint map, converted to luminance, goes
+            # into the Terrain output's "mask" layer and is drawn like Show Mask
+            # (a layer change the viewport always follows). No extra layer.
+            # show_tint: 0 = none, 1..4 = TINT_LAYERS (set by Load Tint / Reset).
+            tint_file = ('chs("../_tint_file_" + arg("{}", max(ch("../show_tint") - 1, 0)))'
+                         .format(" ".join(ghb.TINT_LAYERS)))
+            tint = subnet.createNode("heightfield_file", "tint_to_mask")
+            tint.setInput(0, result)
+            _setp(tint, ("filename", "file"), tint_file, expression=True)
+            _setp(tint, "monoop", "lum", required=False)  # color -> luminance
+            _setp(tint, "type", "mask")
+            _setp(tint, ("layer", "layername"), "mask")
+            _setp(tint, "layermode", "replace", required=False)
+            _setp(tint, "doclampmin", 0, required=False)
+            _setp(tint, "doclampmax", 0, required=False)
+            result = _switch(
+                subnet, "tint_display_switch", (result, tint),
+                'ch("../_imported") && ch("../show_tint") > 0 && '
+                'strlen({}) > 0'.format(tint_file))
         out = subnet.createNode("output", name)
         out.setInput(0, result)
         _setp(out, "outputidx", index)
@@ -580,23 +558,28 @@ def _tint_parm(layer, name, label, kind, default, low, high):
 def _tint_tab():
     """Per-layer Gaea Tint parameters and the tint display."""
     tab = hou.FolderParmTemplate("tint_tab", "Tint", folder_type=hou.folderType.Tabs)
-    # Pick a tint, press Toggle Tint: shown; press again: hidden. The display
-    # state is the hidden show_tint parameter, set only by these callbacks.
+    # Pick a tint (or None), press Load Tint. The display state is the hidden
+    # show_tint parameter, set only by the two buttons.
     layer_menu = hou.MenuParmTemplate(
-        "tint_layer", "Tint Layer", ghb.TINT_LAYERS,
-        menu_labels=tuple(layer.capitalize() for layer in ghb.TINT_LAYERS),
-        default_value=0, script_callback=TINT_LAYER_CALLBACK,
-        script_callback_language=hou.scriptLanguage.Python,
-        help="Which tint to show: the Tint node fed by Erosion2's Out (Height), "
-             "Flow, Wear or Deposits (Sediment), exported as output_tint_<layer>. "
-             "Changing it while a tint is shown shows the new one.")
+        "tint_layer", "Tint", ghb.TINT_MENU,
+        menu_labels=tuple(item.capitalize() for item in ghb.TINT_MENU),
+        default_value=0,
+        help="Which tint Load Tint shows: None, or the Tint node fed by "
+             "Erosion2's Out (Height), Flow, Wear or Deposits (Sediment), exported "
+             "as output_tint_<layer>.")
     layer_menu.setJoinWithNext(True)
     tab.addParmTemplate(layer_menu)
+    load = _button(
+        "load_shade", "Load Tint", LOAD_SHADE_CALLBACK,
+        "Show the tint chosen in the menu on the Terrain output as its mask "
+        "(luminance of the Tint map, drawn like Show Mask); None hides it. Every "
+        "press re-reads the map, so pressing it again reloads the tint. The maps "
+        "are built with every Gaea build.")
+    load.setJoinWithNext(True)
+    tab.addParmTemplate(load)
     tab.addParmTemplate(_button(
-        "toggle_tint", "Toggle Tint", TOGGLE_TINT_CALLBACK,
-        "Show the Tint Layer's color map on the Terrain output (a display material, "
-        "no extra layer); press again to hide it. The maps are built with every "
-        "Gaea build and loaded with the import."))
+        "reset_shade", "Reset", RESET_SHADE_CALLBACK,
+        "Take the tint off the terrain."))
     tab.addParmTemplate(_button(
         "run_cycle_tint", "Export > Build > Import", CYCLE_CALLBACK,
         "Same as on the Bridge tab: build in Gaea (erosion and tint) and import."))
@@ -778,9 +761,11 @@ def _build_parm_template_group():
             "_tint_file_" + layer, layer + " tint map", 1, default_value=("",))))
     g.append(_hidden(hou.ToggleParmTemplate("_tint_loaded", "Tint values loaded",
                                             default_value=False)))
-    # Tint display state, set by Toggle Tint / Tint Layer (hidden on purpose).
-    g.append(_hidden(hou.ToggleParmTemplate("show_tint", "Tint shown",
-                                            default_value=False)))
+    # Tint display state, set only by Load Tint / Reset:
+    # 0 = no tint, 1..4 = ghb.TINT_LAYERS[show_tint - 1].
+    g.append(_hidden(hou.IntParmTemplate("show_tint", "Tint shown", 1,
+                                         default_value=(0,), min=0,
+                                         max=len(ghb.TINT_LAYERS))))
     g.append(_hidden(hou.ToggleParmTemplate("_ero_loaded", "Erosion values loaded",
                                             default_value=False)))
     for layer in ("height",) + MASK_LAYERS:

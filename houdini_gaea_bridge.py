@@ -394,8 +394,9 @@ def find_tint_files(config):
 TINT_DISPLAY_SUBDIR = "tint_display"
 
 
-def tint_display_path(config, layer, source):
+def tint_display_path(config, layer, source, fresh=False):
     """The Tint map of ``layer`` under a name unique to this build, for display.
+    ``fresh``: a name never used before (Load Tint).
 
     Gaea rewrites output_tint_<layer>.exr under the same name, and Houdini's
     viewport keeps showing the texture it loaded for a path. So the display uses
@@ -409,7 +410,10 @@ def tint_display_path(config, layer, source):
         folder = os.path.join(config.bridge_dir, TINT_DISPLAY_SUBDIR)
         os.makedirs(folder, exist_ok=True)
         prefix = "tint_{}_".format(layer)
-        name = "{}{}_{}.exr".format(prefix, info.st_mtime_ns, info.st_size)
+        name = "{}{}_{}".format(prefix, info.st_mtime_ns, info.st_size)
+        if fresh:
+            name += "_r{}".format(time.time_ns())
+        name += ".exr"
         target = os.path.join(folder, name)
         if not os.path.isfile(target):
             try:
@@ -1986,9 +1990,16 @@ def on_tint_toggled(node):
     return None
 
 
+# Tint menu: "none" or a layer. show_tint (hidden) holds what is displayed:
+# 0 = nothing, 1..4 = TINT_LAYERS[show_tint - 1]; only the buttons set it.
+TINT_MENU = ("none",) + TINT_LAYERS
+
+
 def _tint_layer(node):
+    """The Tint menu's choice: "none" or a layer name."""
     parm = node.parm("tint_layer")
-    return parm.evalAsString() if parm is not None else TINT_LAYERS[0]
+    value = parm.evalAsString() if parm is not None else "none"
+    return value if value in TINT_MENU else "none"
 
 
 def refresh_viewport():
@@ -2008,48 +2019,53 @@ def refresh_viewport():
         pass
 
 
-def show_tint(node, show):
-    """Show (or hide) the Tint Layer's color map on the Terrain output.
-
-    The map must have been built and imported. Its display material is cooked
-    before it is switched in, then the viewport reloads its textures. Returns
-    the status message.
-    """
-    layer = _tint_layer(node)
-    path = ""
-    if show:
-        parm = node.parm("_tint_file_" + layer)
-        path = parm.eval() if parm is not None else ""
-        if not node.evalParm("_imported") or not path or not os.path.isfile(path):
-            _set_parm_if_present(node, "show_tint", 0)
-            node.cook(force=True)
-            refresh_viewport()
-            message = ("No {0} tint map imported: build and import with an Export "
-                       "named output_tint_{0} after its Tint node.".format(layer))
-            _set_status(node, message)
-            return message
-        shade = node.node("tint_display_" + layer)
-        if shade is not None:
-            shade.cook(force=True)  # creates its material before it is shown
-    _set_parm_if_present(node, "show_tint", int(bool(show)))
+def _set_tint_display(node, index):
+    """Switch the Terrain output's display (0 = no tint, 1..4 = a layer's Quick
+    Shade), recook and redraw."""
+    _set_parm_if_present(node, "show_tint", index)
     node.cook(force=True)
     refresh_viewport()
-    message = ("Tint shown: {} ({}).".format(layer, os.path.basename(path).strip())
-               if show else "Tint hidden.")
+
+
+def reset_quick_shade(node):
+    """Reset: no tint on the terrain (the Tint menu is left as it is)."""
+    _set_tint_display(node, 0)
+    message = "Tint display reset."
     _set_status(node, message)
     return message
 
 
-def toggle_tint(node):
-    """Toggle Tint button: show the Tint Layer's tint, or hide the shown one."""
-    return show_tint(node, not node.evalParm("show_tint"))
+def load_quick_shade(node):
+    """Load Tint: show the tint chosen in the Tint menu as the Terrain output's
+    mask (luminance of the Tint map); None hides it.
 
-
-def on_tint_layer_changed(node):
-    """Another Tint Layer while a tint is shown: show that one instead."""
-    if node.evalParm("show_tint"):
-        return show_tint(node, True)
-    return None
+    Every press loads the map again: the current tint is taken off and the
+    layer's map is re-read from the output folder under a new file name, so
+    pressing Load again reloads the tint. Returns the status message.
+    """
+    layer = _tint_layer(node)
+    if layer == "none":
+        _set_tint_display(node, 0)
+        message = "Tint hidden."
+        _set_status(node, message)
+        return message
+    _set_tint_display(node, 0)
+    source = None
+    if node.evalParm("_imported"):
+        config = config_from_node(node)
+        source = find_tint_file(config, layer)
+    if source is None:
+        _set_parm_if_present(node, "_tint_file_" + layer, "")
+        message = ("No {0} tint map: build and import with an Export named "
+                   "output_tint_{0} after its Tint node.".format(layer))
+        _set_status(node, message)
+        return message
+    path = tint_display_path(config, layer, source, fresh=True)
+    _set_parm_if_present(node, "_tint_file_" + layer, path)
+    _set_tint_display(node, TINT_LAYERS.index(layer) + 1)
+    message = "Tint loaded: {} ({}).".format(layer, os.path.basename(path).strip())
+    _set_status(node, message)
+    return message
 
 
 def _int_or_none(value):
@@ -2181,7 +2197,7 @@ def import_into_node(node, config=None, set_display=True):
         imported, skipped, peaks, "", bool(encoding.get("span"))
     )
     if tint:
-        message += "  Tint maps loaded: {} (Tint tab > Toggle Tint).".format(
+        message += "  Tint maps loaded: {} (Tint tab > Load Tint).".format(
             ", ".join(layer for layer in TINT_LAYERS if layer in tint))
     if removed:
         message += "  Removed old import nodes: {}.".format(", ".join(removed))
