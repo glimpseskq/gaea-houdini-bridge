@@ -29,6 +29,8 @@ Quick use from a Houdini shelf tool::
 import json
 import os
 import hashlib
+import itertools
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field, asdict
@@ -42,6 +44,9 @@ from dataclasses import dataclass, field, asdict
 # gh_bridge_config.json next to this file, or the Bridge Dir parameter on the HDA.
 DEFAULT_BRIDGE_DIR = r"C:/Temp/gh_bridge"
 DEFAULT_INPUT_NAME = "input_height.exr"
+# Mask from the node's second input, read in Gaea by the File node wired into a
+# "Mask" port (e.g. Erosion2's). Without a mask input it's all white (no masking).
+DEFAULT_MASK_INPUT_NAME = "input_mask.exr"
 DEFAULT_OUTPUT_SUBDIR = "output"
 MANIFEST_NAME = "gh_bridge_manifest.json"
 CONFIG_NAME = "gh_bridge_config.json"
@@ -55,6 +60,10 @@ DEFAULT_OUTPUT_MAPS = {
     "wear": "output_wear.exr",
     "sediment": "output_sediment.exr",
 }
+
+# Color map of the Gaea Tint chain (Tint nodes -> Combine -> this Export). Shown
+# on the terrain on request (Tint tab), never imported as a layer.
+DEFAULT_TINT_OUTPUT = "output_tint_combine.exr"
 
 # Mask layers (everything but height) are normalized to 0..1 on import, and one of
 # them can be copied into the "mask" layer, which Houdini draws in the viewport and
@@ -107,19 +116,48 @@ class BridgeConfig:
     # the Export nodes. Swarm then builds a copy with these Erosion2 values
     # ({Gaea property name: value}); the original project stays untouched.
     use_template: bool = False
-    erosion_node: str = ""  # Erosion2 node name; "" = the only one in the project
+    erosion_node: str = ""  # erosion node name; "" = the only one in the project
     erosion_params: dict = field(default_factory=dict)
+    # Which Gaea erosion node the project uses: "Erosion2" or the older "Erosion"
+    # (one bridge HDA per kind; each has its own parameter set).
+    erosion_kind: str = "Erosion2"
+    # Folder (with subfolders) searched for the project when gaea_project is
+    # empty: <kind>.terrain first, else any project with that erosion node.
+    gaea_projects_dir: str = ""
+    # Tint (Tint tab): the Export node writing the project's color map, only shown
+    # on the terrain (Show / Hide Tint), never output as a layer. The Tint settings
+    # are the project's own. With build_tint off, the build copy leaves out that
+    # Export and the nodes feeding only it, so Gaea doesn't compute them.
+    tint_output_name: str = DEFAULT_TINT_OUTPUT
+    build_tint: bool = True
+
+    @property
+    def builds_copy(self):
+        """Swarm always builds a copy of the project: the bridge's input/mask/
+        export paths are set in it (the saved project is never modified), the
+        Erosion2 values come from Houdini with use_template, and the tint chain
+        is left out with build_tint off."""
+        return True
     # Gaea world size in metres. 0 = read it from gaea_project, else the defaults.
     gaea_width: float = 0.0
     gaea_height: float = 0.0
     # Imported layer to copy into the "mask" layer ("" = leave mask alone).
     mask_layer: str = DEFAULT_MASK_LAYER
+    # Mask sent to Gaea from the node's second input.
+    mask_input_name: str = DEFAULT_MASK_INPUT_NAME
+    # Layer of the mask input to use: "auto" (mask, else height, else the only
+    # volume) or a layer name.
+    mask_input_layer: str = "auto"
 
     # -- derived paths ----------------------------------------------------- #
 
     @property
     def input_path(self):
         return os.path.join(self.bridge_dir, self.input_name)
+
+    @property
+    def mask_input_path(self):
+        return os.path.join(self.bridge_dir, self.mask_input_name)
 
     @property
     def output_dir(self):
@@ -340,13 +378,63 @@ def find_output_file(config, layer_name):
     matches ignoring case and surrounding spaces (a Gaea Export node named
     " output_flow" writes " output_flow.exr"). Empty files don't count.
     """
+    return _find_named_output(config, config.output_maps[layer_name])
+
+
+def find_tint_file(config):
+    """Path of the Gaea Tint color map, or None."""
+    return _find_named_output(config, config.tint_output_name)
+
+
+TINT_DISPLAY_SUBDIR = "tint_display"
+_FRESH_COUNTER = itertools.count()
+
+
+def tint_display_path(config, source, fresh=False):
+    """The Tint map under a name unique to this build, for display.
+    ``fresh``: a name never used before (Show / Hide Tint).
+
+    Gaea rewrites output_tint_<layer>.exr under the same name, and Houdini's
+    viewport keeps showing the texture it loaded for a path. So the display uses
+    <Bridge Dir>/tint_display/tint_<layer>_<build stamp>.exr: a hard link to the
+    output (no copy, no extra space), or a copy where links are not possible.
+    Older maps of the layer are removed (if Windows still holds one open, it is
+    left for next time). Falls back to ``source`` on any error.
+    """
+    try:
+        info = os.stat(source)
+        folder = os.path.join(config.bridge_dir, TINT_DISPLAY_SUBDIR)
+        os.makedirs(folder, exist_ok=True)
+        prefix = "tint_"
+        name = "{}{}_{}".format(prefix, info.st_mtime_ns, info.st_size)
+        if fresh:  # never reused in a session, even within the same millisecond
+            name += "_r{}_{}".format(time.time_ns(), next(_FRESH_COUNTER))
+        name += ".exr"
+        target = os.path.join(folder, name)
+        if not os.path.isfile(target):
+            try:
+                os.link(source, target)
+            except OSError:
+                shutil.copyfile(source, target)
+        for old in os.listdir(folder):
+            if old.startswith(prefix) and old != name:
+                try:
+                    os.remove(os.path.join(folder, old))
+                except OSError:
+                    pass
+        return target
+    except OSError:
+        return source
+
+
+def _find_named_output(config, filename):
     def usable(path):
         return os.path.isfile(path) and os.path.getsize(path) > 0
 
-    exact = config.output_path(layer_name)
+    exact = os.path.join(config.output_dir, filename)
     if usable(exact):
         return exact
-    wanted = config.output_maps[layer_name].strip().casefold()
+    wanted = filename.strip().casefold()
     try:
         names = sorted(os.listdir(config.output_dir))
     except OSError:
@@ -487,14 +575,101 @@ def _collect_nodes(data, kind, found):
     return found
 
 
-def check_project_paths(config):
+def mask_file_nodes(data):
+    """File nodes of a .terrain that feed a port named "Mask" (e.g. Erosion2's)."""
+    sources = set()
+
+    def walk(value):
+        if isinstance(value, dict):
+            record = value.get("Record")
+            if isinstance(record, dict) and str(record.get("ToPort", "")).strip() \
+                    .casefold() == "mask":
+                sources.add(record.get("From"))
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(data)
+    return [node for node in _collect_nodes(data, "File", [])
+            if node.get("Id") in sources]
+
+
+def input_file_nodes(data, config):
+    """File nodes of a .terrain that load the bridge's input terrain: every File
+    not feeding a Mask port when there is only one, else those whose file name
+    is the input's (input_height.exr), whatever folder they point to."""
+    masks = {id(node) for node in mask_file_nodes(data)}
+    files = [node for node in _collect_nodes(data, "File", []) if id(node) not in masks]
+    if len(files) == 1:
+        return files
+    wanted = config.input_name.strip().casefold()
+    return [node for node in files if os.path.basename(
+        str(node.get("FileName", "")).replace("\\", "/")).strip().casefold() == wanted]
+
+
+def choose_mask_layer(ranges, preferred="auto"):
+    """Pick the mask input's layer and the range that maps it to 0..1.
+
+    ``ranges``: ``{volume name: (min, max)}`` of the mask input. Returns
+    ``(layer, low, high)``: the bridge writes ``clamp(fit(layer, low, high, 0, 1))``.
+
+    * ``preferred`` other than "auto" must exist.
+    * "auto": ``mask`` if it holds anything (a HeightField always has a mask layer,
+      empty unless something painted it), else ``height`` (e.g. a noise HeightField
+      used as a mask), else the only volume.
+    * A ``mask`` already within 0..1 is kept as is (0.3 stays 0.3); anything else
+      is stretched from its min..max to 0..1. A constant layer maps to all 1
+      (or all 0 when it is <= 0).
+    """
+    if not ranges:
+        raise ValueError("The mask input has no volumes.")
+    name = (preferred or "auto").strip()
+    if name.casefold() != "auto":
+        if name not in ranges:
+            raise ValueError("The mask input has no layer {!r} (has: {}).".format(
+                name, ", ".join(sorted(ranges))))
+        layer = name
+    elif "mask" in ranges and ranges["mask"][1] > 1e-6:
+        layer = "mask"
+    elif "height" in ranges and ranges["height"][1] - ranges["height"][0] > 1e-6:
+        layer = "height"
+    elif len(ranges) == 1:
+        layer = next(iter(ranges))
+    else:
+        layer = "mask" if "mask" in ranges else sorted(ranges)[0]
+    low, high = (float(v) for v in ranges[layer])
+    if layer == "mask" and low >= -1e-6 and high <= 1.0 + 1e-6:
+        return layer, 0.0, 1.0
+    if high - low <= 1e-6:
+        return (layer, high - 1.0, high) if high > 0 else (layer, high, high + 1.0)
+    return layer, low, high
+
+
+def _bridge_export_name(config, export):
+    """Which bridge output a Gaea Export node writes ("height", "flow", ... or
+    "tint"), matched on its name ignoring case and spaces; None for other exports."""
+    name = str(export.get("Name", "")).strip().casefold()
+    names = dict(config.output_maps, tint=config.tint_output_name)
+    for key, filename in names.items():
+        if os.path.splitext(filename)[0].strip().casefold() == name:
+            return key
+    return None
+
+
+def check_project_paths(config, fix_mask_paths=False):
     """Check that the saved Gaea project reads and writes the bridge's files.
 
     Swarm builds the project *as saved*, so its File node must load the input EXR
     and its Export nodes must write EXR files into the output folder. Returns a
     list of human-readable problems (empty when everything matches).
     """
-    if not config.gaea_project or not os.path.isfile(config.gaea_project):
+    if not config.gaea_project:
+        return ["No Gaea project: set Gaea Project, or put {} (or any project with "
+                "an {} node) into Gaea Projects Dir.".format(
+                    project_name_for_kind(config.erosion_kind), config.erosion_kind)]
+    if not os.path.isfile(config.gaea_project):
         return ["Gaea project not found: {!r}.".format(config.gaea_project)]
     try:
         with open(config.gaea_project, "r", encoding="utf-8-sig") as handle:
@@ -503,20 +678,38 @@ def check_project_paths(config):
         return ["Could not read the Gaea project: {}.".format(error)]
 
     problems = []
-    file_nodes = _collect_nodes(data, "File", [])
-    if not any(_same_path(node.get("FileName", ""), config.input_path)
-               for node in file_nodes):
+    masks = mask_file_nodes(data)
+    if not fix_mask_paths:  # template builds point them to the mask automatically
+        for node in masks:
+            if not _same_path(node.get("FileName", ""), config.mask_input_path):
+                problems.append(
+                    "The File node {!r} feeding a Mask port should load {} (loads "
+                    "{!r}); or turn on Use Erosion Template, which sets it.".format(
+                        node.get("Name"), config.mask_input_path,
+                        node.get("FileName", "")))
+    file_nodes = [node for node in _collect_nodes(data, "File", [])
+                  if node not in masks]
+    if fix_mask_paths:  # build copies point the input File node to the input
+        if not input_file_nodes(data, config):
+            problems.append(
+                "No File node for the input terrain: the project needs one File "
+                "node (besides the mask's) or one loading a file named {} (found: "
+                "{}).".format(config.input_name, ", ".join(
+                    repr(node.get("FileName", "")) for node in file_nodes) or "none"))
+    elif not any(_same_path(node.get("FileName", ""), config.input_path)
+                 for node in file_nodes):
         problems.append("No File node in the project loads {} (found: {}).".format(
             config.input_path,
             ", ".join(repr(node.get("FileName", "")) for node in file_nodes) or "none"))
 
     exports = _collect_nodes(data, "Export", [])
-    wanted = {os.path.splitext(name)[0].strip().casefold(): layer
-              for layer, name in config.output_maps.items()}
     matched = set()
     for node in exports:
-        layer = wanted.get(str(node.get("Name", "")).strip().casefold())
+        layer = _bridge_export_name(config, node)
         if layer is None:
+            continue
+        matched.add(layer)
+        if fix_mask_paths:  # build copies fix Location/Output Path/Format
             continue
         name = str(node.get("Name", "")).strip()
         if node.get("Location") != "Custom" or not _same_path(
@@ -526,7 +719,6 @@ def check_project_paths(config):
         if node.get("Format", "EXR") != "EXR":
             problems.append("Export node {!r} should use Format EXR (is {}).".format(
                 name, node.get("Format")))
-        matched.add(layer)
     if "height" not in matched:
         problems.append("No Export node named {!r} in the project.".format(
             os.path.splitext(config.output_maps.get("height", "output_height"))[0]))
@@ -534,12 +726,16 @@ def check_project_paths(config):
 
 
 def updated_outputs(config, since):
-    """Layers whose output file was (re)written at or after ``since`` (epoch s)."""
+    """Layers whose output file was (re)written at or after ``since`` (epoch s);
+    a rewritten Tint map follows as "tint"."""
     layers = []
     for layer in config.output_maps:
         path = find_output_file(config, layer)
         if path is not None and os.path.getmtime(path) >= since - 1.0:
             layers.append(layer)
+    tint = find_tint_file(config)
+    if layers and tint is not None and os.path.getmtime(tint) >= since - 1.0:
+        layers.append("tint")
     return layers
 
 
@@ -557,6 +753,7 @@ class SwarmBuild:
         self.command = command or swarm_command(config)
         self.started = time.time()
         self.note = ""
+        self.on_done = None
         self._process = None
 
     def start(self):
@@ -642,38 +839,223 @@ EROSION2_DEFAULTS = {spec[0]: spec[4] for spec in EROSION2_PARAMS}
 EROSION2_TYPES = {spec[0]: spec[3] for spec in EROSION2_PARAMS}
 TEMPLATE_BUILD_NAME = "gaea_template_build.terrain"
 
+# The older Erosion node (QuadSpinner.Gaea.Nodes.Erosion, Gaea 2.3), same layout;
+# enums are (property, label, group, "enum", default, values, None). Only the
+# Information block is skipped.
+EROSION1_AREA_EFFECT = ("None", "ErosionStrength", "RockSoftness", "PrecipitationAmount")
+EROSION1_BIAS_TYPE = ("Altitude", "Slope")
+EROSION1_PARAMS = (
+    ("Duration", "Duration", "Erosion", "float", 0.04, 0.0001, 1.0),
+    ("RockSoftness", "Rock Softness", "Erosion", "float", 0.65, 0.05, 1.0),
+    ("Strength", "Strength", "Erosion", "float", 0.5, 0.0001, 1.0),
+    ("Downcutting", "Downcutting", "Downcutting", "float", 0.1, 0.0, 1.0),
+    ("Inhibition", "Inhibition", "Downcutting", "float", 0.5, 0.0, 5.0),
+    ("BaseLevel", "Base Level", "Downcutting", "float", 0.0, 0.0, 5.0),
+    ("FeatureScale", "Feature Scale", "Scale", "int", 2000, 5, 20000),
+    ("RealScale", "Real Scale", "Scale", "bool", True, 0, 1),
+    ("TerrainScale", "Terrain Scale", "Scale", "int", 10000, 500, 20000),
+    ("Verticality", "Verticality", "Scale", "int", 2000, 5, 20000),
+    ("Debris", "Debris", "Flow", "float", 0.0, 0.0, 5.0),
+    ("Volume", "Volume", "Flow", "float", 0.0, 0.0, 5.0),
+    ("SedimentRemoval", "Sediment Removal", "Flow", "float", 0.0, 0.0, 1.0),
+    ("AreaEffect", "Area Effect", "Selective Processing", "enum", "None",
+     EROSION1_AREA_EFFECT, None),
+    ("BiasType", "Bias Type", "Selective Processing", "enum", "Altitude",
+     EROSION1_BIAS_TYPE, None),
+    ("Bias", "Bias", "Selective Processing", "float", 0.7, 0.0, 1.0),
+    ("Reverse", "Reverse", "Selective Processing", "bool", False, 0, 1),
+    ("Seed", "Seed", "Other Settings", "int", 0, 0, 65535),
+    ("AggressiveMode", "Aggressive Mode", "Other Settings", "bool", True, 0, 1),
+    ("Deterministic", "Deterministic", "Other Settings", "bool", False, 0, 1),
+)
 
-def _coerce(name, value):
-    kind = EROSION2_TYPES[name]
+# Erosion node kind (Gaea node type name) -> its parameter spec.
+EROSION_SPECS = {"Erosion2": EROSION2_PARAMS, "Erosion": EROSION1_PARAMS}
+
+
+def erosion_spec(kind):
+    try:
+        return EROSION_SPECS[kind]
+    except KeyError:
+        raise ValueError("Unknown erosion node kind {!r} (expected one of {}).".format(
+            kind, ", ".join(EROSION_SPECS)))
+
+
+def erosion_types(kind):
+    return {spec[0]: spec[3] for spec in erosion_spec(kind)}
+
+
+def erosion_defaults(kind):
+    return {spec[0]: spec[4] for spec in erosion_spec(kind)}
+
+
+def _coerce_kind(kind, value):
     if kind == "bool":
         return bool(value)
     if kind == "int":
         return int(round(float(value)))
+    if kind == "color":
+        if isinstance(value, dict):
+            value = (value.get("R", 0.0), value.get("G", 0.0), value.get("B", 0.0))
+        return tuple(float(component) for component in value)[:3]
+    if kind == "enum":
+        return str(value)
     return float(value)
 
 
-def _same_value(name, a, b):
-    if EROSION2_TYPES[name] == "float":
-        return abs(float(a) - float(b)) <= 1e-6 * max(1.0, abs(float(a)), abs(float(b)))
-    return _coerce(name, a) == _coerce(name, b)
+def _same_kind(kind, a, b):
+    a, b = _coerce_kind(kind, a), _coerce_kind(kind, b)
+    if kind == "float":
+        return abs(a - b) <= 1e-6 * max(1.0, abs(a), abs(b))
+    if kind == "color":
+        return all(abs(x - y) <= 1e-6 for x, y in zip(a, b))
+    return a == b
 
 
-def find_erosion_node(data, node_name=""):
-    """The Erosion2 node dict of a parsed .terrain. With several, pick by name."""
-    nodes = _collect_nodes(data, "Erosion2", [])
+def _to_gaea(kind, value):
+    """Value as Gaea stores it in a .terrain."""
+    value = _coerce_kind(kind, value)
+    if kind == "color":
+        return {"R": value[0], "G": value[1], "B": value[2]}
+    return value
+
+
+def find_gaea_node(data, kind, node_name="", setting="Node"):
+    """The ``kind`` node ("Erosion2", "Erosion") of a parsed .terrain. With
+    several, pick by name."""
+    nodes = _collect_nodes(data, kind, [])
     if not nodes:
-        raise ValueError("The Gaea project has no Erosion2 node.")
+        raise ValueError("The Gaea project has no {} node.".format(kind))
     if node_name:
         for node in nodes:
             if str(node.get("Name", "")).strip() == node_name.strip():
                 return node
-        raise ValueError("No Erosion2 node named {!r} (found: {}).".format(
-            node_name, ", ".join(repr(n.get("Name")) for n in nodes)))
+        raise ValueError("No {} node named {!r} (found: {}).".format(
+            kind, node_name, ", ".join(repr(n.get("Name")) for n in nodes)))
     if len(nodes) > 1:
-        raise ValueError("The project has several Erosion2 nodes ({}); set Erosion "
-                         "Node to the one feeding the exports.".format(
-                             ", ".join(repr(n.get("Name")) for n in nodes)))
+        raise ValueError("The project has several {} nodes ({}); set {} to the one "
+                         "to drive.".format(kind, ", ".join(
+                             repr(n.get("Name")) for n in nodes), setting))
     return nodes[0]
+
+
+def find_erosion_node(data, node_name="", kind="Erosion2"):
+    """The erosion node dict (``kind``: "Erosion2" or "Erosion") of a parsed
+    .terrain. With several, pick by name."""
+    erosion_spec(kind)  # validates the kind
+    return find_gaea_node(data, kind, node_name, "Erosion Node")
+
+
+def _port_sources(node):
+    """[(port name, source node id)] of a Gaea node's connected input ports."""
+    ports = node.get("Ports")
+    if isinstance(ports, dict):
+        ports = ports.get("$values")
+    sources = []
+    for port in ports if isinstance(ports, list) else ():
+        record = port.get("Record") if isinstance(port, dict) else None
+        if isinstance(record, dict) and record.get("From") is not None:
+            sources.append((str(port.get("Name", "")), record.get("From")))
+    return sources
+
+
+def _nodes_by_id(data):
+    nodes = {}
+
+    def walk(value):
+        if isinstance(value, dict):
+            if "Id" in value and ".Nodes." in str(value.get("$type", "")):
+                nodes[value["Id"]] = value
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(data)
+    return nodes
+
+
+def _upstream(by_id, start_ids):
+    """Ids of ``start_ids`` and everything feeding them, through any port."""
+    seen = set()
+    stack = list(start_ids)
+    while stack:
+        node_id = stack.pop()
+        if node_id in seen or node_id not in by_id:
+            continue
+        seen.add(node_id)
+        stack.extend(source for _, source in _port_sources(by_id[node_id]))
+    return seen
+
+
+def strip_tint_exports(data, config):
+    """Remove the Tint Export node(s) from a parsed .terrain together with every
+    node that feeds nothing else (the Tint / Combine chain), so a build skips
+    them. Nodes also feeding a remaining Export stay. Returns the removed names.
+
+    Safe to do in the JSON: a node's "$id" is only referenced from its own ports
+    and Erosion2's output ports don't record their consumers.
+    """
+    exports = _collect_nodes(data, "Export", [])
+    dropped = [e.get("Id") for e in exports if _bridge_export_name(config, e) == "tint"]
+    if not dropped:
+        return []
+    by_id = _nodes_by_id(data)
+    keep = _upstream(by_id, [e.get("Id") for e in exports if e.get("Id") not in dropped])
+    remove = _upstream(by_id, dropped) - keep
+    removed = []
+
+    def prune(value):
+        if isinstance(value, dict):
+            for key in list(value):
+                child = value[key]
+                if (isinstance(child, dict) and child.get("Id") in remove
+                        and ".Nodes." in str(child.get("$type", ""))):
+                    removed.append(str(child.get("Name", key)).strip())
+                    del value[key]
+                else:
+                    prune(child)
+        elif isinstance(value, list):
+            for child in value:
+                prune(child)
+
+    prune(data)
+    return removed
+
+
+def read_node_params(node, specs):
+    """Values of a Gaea node: stored values, Gaea defaults for the rest."""
+    values = {}
+    for spec in specs:
+        name, kind, default = spec[0], spec[3], spec[4]
+        try:
+            values[name] = _coerce_kind(kind, node.get(name, default))
+        except (TypeError, ValueError):
+            values[name] = _coerce_kind(kind, default)
+    return values
+
+
+def apply_node_params(node, specs, values):
+    """Write the values that differ from the node's current ones; unknown names
+    are skipped. Returns the names that changed."""
+    known = {spec[0]: spec for spec in specs}
+    changed = []
+    for name, value in sorted(values.items()):
+        spec = known.get(name)
+        if spec is None:
+            continue
+        kind, default = spec[3], spec[4]
+        if kind == "enum" and str(value) not in spec[5]:
+            continue
+        try:
+            if _same_kind(kind, value, node.get(name, default)):
+                continue
+            node[name] = _to_gaea(kind, value)
+        except (TypeError, ValueError):
+            continue
+        changed.append(name)
+    return changed
 
 
 def _load_project(path):
@@ -681,17 +1063,11 @@ def _load_project(path):
         return json.load(handle)
 
 
-def read_erosion_params(path, node_name=""):
-    """Erosion2 values of a project: stored values, Gaea defaults for the rest
+def read_erosion_params(path, node_name="", kind="Erosion2"):
+    """Erosion values of a project: stored values, Gaea defaults for the rest
     (Gaea only saves values that differ from the default)."""
-    node = find_erosion_node(_load_project(path), node_name)
-    values = {}
-    for name in EROSION2_DEFAULTS:
-        try:
-            values[name] = _coerce(name, node.get(name, EROSION2_DEFAULTS[name]))
-        except (TypeError, ValueError):
-            values[name] = EROSION2_DEFAULTS[name]
-    return values
+    return read_node_params(find_erosion_node(_load_project(path), node_name, kind),
+                            erosion_spec(kind))
 
 
 def write_template_copy(config, destination):
@@ -701,19 +1077,43 @@ def write_template_copy(config, destination):
     doesn't know are left as they are. Returns the names that were changed.
     """
     data = _load_project(config.gaea_project)
-    node = find_erosion_node(data, config.erosion_node)
     changed = []
-    for name, value in sorted(config.erosion_params.items()):
-        if name not in EROSION2_DEFAULTS:
-            continue  # unknown parameter: skip
-        current = node.get(name, EROSION2_DEFAULTS[name])
-        try:
-            if _same_value(name, value, current):
-                continue
-            node[name] = _coerce(name, value)
-        except (TypeError, ValueError):
+    if config.use_template:
+        changed += apply_node_params(
+            find_erosion_node(data, config.erosion_node, config.erosion_kind),
+            erosion_spec(config.erosion_kind), config.erosion_params)
+    if not config.build_tint:
+        removed = strip_tint_exports(data, config)
+        if removed:
+            changed.append("tint skipped ({} nodes)".format(len(removed)))
+    for node in input_file_nodes(data, config):
+        if not _same_path(node.get("FileName", ""), config.input_path):
+            node["FileName"] = os.path.normpath(config.input_path)
+            if "input file" not in changed:
+                changed.append("input file")
+    for mask in mask_file_nodes(data):
+        if not _same_path(mask.get("FileName", ""), config.mask_input_path):
+            mask["FileName"] = os.path.normpath(config.mask_input_path)
+            changed.append("mask file")
+    # The bridge's Export nodes must write EXR into the output folder.
+    fixed = False
+    for export in _collect_nodes(data, "Export", []):
+        if _bridge_export_name(config, export) is None:
             continue
-        changed.append(name)
+        if export.get("Location") != "Custom":
+            export["Location"] = "Custom"
+            fixed = True
+        if not _same_path(export.get("OutputPath", ""), config.output_dir):
+            export["OutputPath"] = os.path.normpath(config.output_dir)
+            fixed = True
+        if export.get("Format", "EXR") != "EXR":
+            export["Format"] = "EXR"
+            fixed = True
+        if export.get("IfFileExists", "Overwrite") != "Overwrite":
+            export["IfFileExists"] = "Overwrite"
+            fixed = True
+    if fixed:
+        changed.append("export paths")
     folder = os.path.dirname(destination)
     if folder:
         os.makedirs(folder, exist_ok=True)
@@ -735,7 +1135,9 @@ def build_settings(config):
         settings["project"] = [info.st_size, info.st_mtime_ns // 1000000]
     if config.use_template:
         settings["template"] = {"node": config.erosion_node,
+                                "kind": config.erosion_kind,
                                 "params": dict(config.erosion_params)}
+    settings["build_tint"] = bool(config.build_tint)
     return settings
 
 
@@ -748,11 +1150,13 @@ def validate_build(config):
                         "Exe on the Paths tab.".format(exe))
     if not os.path.isfile(config.input_path):
         problems.append("No exported input yet: press Export first.")
-    problems += check_project_paths(config)
-    if config.use_template and config.gaea_project and os.path.isfile(
+    problems += check_project_paths(config, fix_mask_paths=config.builds_copy)
+    if config.builds_copy and config.gaea_project and os.path.isfile(
             config.gaea_project):
         try:
-            find_erosion_node(_load_project(config.gaea_project), config.erosion_node)
+            data = _load_project(config.gaea_project)
+            if config.use_template:
+                find_erosion_node(data, config.erosion_node, config.erosion_kind)
         except (ValueError, OSError) as error:
             problems.append(str(error))
     return problems
@@ -934,8 +1338,8 @@ def heightfield_info(source_node):
     )
 
 
-def _configure_height_channels(export_node, encoding):
-    """Write the ``height`` layer as grayscale RGB, encoded for Gaea's world scale.
+def _configure_height_channels(export_node, encoding, layer="height"):
+    """Write ``layer`` as grayscale RGB, encoded for Gaea's world scale.
 
     heightfield_output leaves the channel layers empty by default and fills them with
     a constant 1.0 (a flat terrain in Gaea), so the layer is set explicitly. Heights
@@ -959,7 +1363,7 @@ def _configure_height_channels(export_node, encoding):
         fill = export_node.parm("fill_{}_channel".format(channel))
         if fill is not None:
             fill.set(1)
-        parms["layer"].set("height")
+        parms["layer"].set(layer)
         parms["range"].set("manual")
         parms["from"].set((low, high))
         parms["to"].set((0.0, 1.0))
@@ -1022,8 +1426,9 @@ def _verify_export(parent, path, encoding, flat):
                 low, high, expected, houdini_version_string()))
 
 
-def _export_heightfield(source_node, input_path, encoding, image_size):
-    """Write the source ``height`` layer to ``input_path`` using ``encoding``.
+def _export_heightfield(source_node, input_path, encoding, image_size,
+                        layer="height", verify=True):
+    """Write the source's ``layer`` to ``input_path`` using ``encoding``.
 
     ``image_size`` is ``(x, y)`` in pixels; heightfield_output resamples the layer
     to it, so the exported terrain keeps its world size at a lower resolution.
@@ -1036,7 +1441,7 @@ def _export_heightfield(source_node, input_path, encoding, image_size):
     )
     try:
         export_node.setInput(0, source_node)
-        _configure_height_channels(export_node, encoding)
+        _configure_height_channels(export_node, encoding, layer=layer)
         _set_export_resolution(export_node, image_size)
         file_parm_name = None
         for name in OUTPUT_FILE_PARM_CANDIDATES:
@@ -1068,8 +1473,139 @@ def _export_heightfield(source_node, input_path, encoding, image_size):
         raise RuntimeError("Houdini did not create the input EXR: {}".format(input_path))
     if os.path.getsize(input_path) == 0:
         raise RuntimeError("Houdini created an empty input EXR: {}".format(input_path))
-    _verify_export(parent, input_path, encoding,
-                   flat=encoding["max_value"] < 1e-9)
+    if verify:
+        _verify_export(parent, input_path, encoding,
+                       flat=encoding["max_value"] < 1e-9)
+
+
+def _volume_ranges(geometry):
+    """``({name: (min, max)}, {name: prim number})`` of the volumes in ``geometry``
+    (unnamed volumes get "volume<N>")."""
+    import hou
+
+    ranges, numbers = {}, {}
+    has_name = geometry.findPrimAttrib("name") is not None
+    for index, prim in enumerate(geometry.prims()):
+        if prim.type() != hou.primType.Volume:
+            continue
+        name = prim.attribValue("name") if has_name else ""
+        name = name or "volume{}".format(index)
+        if name not in ranges:
+            ranges[name] = (float(prim.volumeMin()), float(prim.volumeMax()))
+            numbers[name] = prim.number()
+    return ranges, numbers
+
+
+class MaskNetwork:
+    """Temporary nodes that put the mask input onto the terrain's grid as "mask".
+
+    Any mask works: a HeightField (its ``mask`` layer, or ``height`` for a
+    procedural noise HeightField), any other volume, or plain geometry (polygons,
+    curves...) turned into a mask with HeightField Mask by Object. Its resolution,
+    size and position don't matter; outside its area the mask is 0. Without a mask
+    input the mask is 1 everywhere (Gaea erodes the whole terrain).
+
+    Use as a context manager: the nodes are deleted on exit.
+    """
+
+    def __init__(self, source_node, mask_node, preferred_layer="auto"):
+        self.source = source_node
+        self.mask_input = mask_node
+        self.preferred = preferred_layer
+        self.nodes = []
+        self.output = None
+        self.info = {}
+
+    def _create(self, type_names, name, inputs):
+        if isinstance(type_names, str):
+            type_names = (type_names,)
+        node = _create_node_from_candidates(self.source.parent(), type_names, name)
+        self.nodes.append(node)
+        for index, src in enumerate(inputs):
+            node.setInput(index, src)
+        return node
+
+    def _wrangle(self, name, source, snippet):
+        node = self._create("volumewrangle", name, (source,))
+        _set_first_available_parm(node, ("snippet",), snippet)
+        return node
+
+    def build(self):
+        mask = self.mask_input
+        geometry = mask.geometry() if mask is not None else None
+        if mask is None or geometry is None or not geometry.prims():
+            self.output = self._wrangle("gaea_bridge_mask_full", self.source,
+                                        "f@mask = 1;\n")
+            self.info = {"source": "none (all white)"}
+            return self
+        ranges, numbers = _volume_ranges(geometry)
+        if ranges:
+            layer, low, high = choose_mask_layer(ranges, self.preferred)
+            # 1. In the mask input: the chosen volume becomes "mask" (any other
+            #    "mask" is dropped), mapped to 0..1. Its border is set to constant
+            #    0: HeightField height layers use "streak", which would smear the
+            #    edge values over the whole terrain outside the mask's area.
+            rename = self._create("attribwrangle", "gaea_bridge_mask_pick", (mask,))
+            _set_first_available_parm(rename, ("class",), "primitive")
+            _set_first_available_parm(rename, ("snippet",), (
+                "if (@primnum == {0}) {{\n"
+                "    s@name = \"mask\";\n"
+                "    setprimintrinsic(0, \"volumebordertype\", @primnum, \"constant\");\n"
+                "    setprimintrinsic(0, \"volumebordervalue\", @primnum, 0.0);\n"
+                "}}\n"
+                "else if (s@name == \"mask\") removeprim(0, @primnum, 1);\n"
+            ).format(numbers[layer]))
+            remap = self._wrangle(
+                "gaea_bridge_mask_remap", rename,
+                "f@mask = clamp(fit(f@mask, {!r}, {!r}, 0, 1), 0, 1);\n".format(
+                    float(low), float(high)))
+            # 2. On the terrain: start from an empty mask and replace it with the
+            #    mask input where they overlap; outside its area the mask stays 0.
+            base = self._wrangle("gaea_bridge_mask_clear", self.source,
+                                 "f@mask = 0;\n")
+            self.output = self._create("heightfield_layer",
+                                       "gaea_bridge_mask_resample", (base, remap))
+            _set_first_available_parm(self.output, ("layer",), "mask")
+            _set_parm_if_present(self.output, "mode", "replace")
+            self.info = {"source": "layer", "layer": layer, "range": [low, high]}
+        else:
+            # Plain geometry: mask where it is, seen from above.
+            self.output = self._create("heightfield_maskbyobject",
+                                       "gaea_bridge_mask_object", (self.source, mask))
+            self.info = {"source": "geometry (Mask by Object)"}
+        self.output.cook(force=True)
+        errors = self.output.errors()
+        if errors:
+            raise RuntimeError("Could not build the mask: " + " ".join(errors))
+        return self
+
+    def mask_prim(self):
+        for prim in self.output.geometry().prims():
+            if prim.attribValue("name") == "mask":
+                return prim
+        raise RuntimeError("The mask network produced no 'mask' layer.")
+
+    def content_hash(self):
+        prim = self.mask_prim()
+        digest = hashlib.sha1(prim.allVoxelsAsString())
+        digest.update(_normalise_dict(self.info).encode("utf-8"))
+        return digest.hexdigest()
+
+    def coverage(self):
+        """Mean mask value (0..1): how much of the terrain is masked in."""
+        values = self.mask_prim().allVoxels()
+        return sum(values) / float(len(values) or 1)
+
+    def __enter__(self):
+        return self.build()
+
+    def __exit__(self, *exc):
+        for node in reversed(self.nodes):
+            try:
+                node.destroy()
+            except Exception:
+                pass
+        return False
 
 
 def _get_or_create_node(parent, type_names, node_name):
@@ -1178,18 +1714,23 @@ def _require_node(source_node):
         raise TypeError("source_node must be a Houdini hou.Node")
 
 
-def export_for_gaea(source_node, config=None, use_cache=True):
-    """Write the HeightField to the input EXR and record a manifest.
+def export_for_gaea(source_node, config=None, use_cache=True, mask_node=None):
+    """Write the HeightField and the mask to the input EXRs and record a manifest.
 
-    Returns a dict with keys: ``input``, ``signature``, ``cache_hit``, ``message``.
-    When ``use_cache`` is true and nothing relevant changed since the last build, the
-    manifest already matches and ``cache_hit`` is True (no Gaea rebuild needed).
+    ``mask_node`` is the node's mask input (None = all white). Returns a dict with
+    keys: ``input``, ``signature``, ``cache_hit``, ``message``. When ``use_cache``
+    is true and nothing relevant changed since the last build, the manifest
+    already matches and ``cache_hit`` is True (no Gaea rebuild needed).
     """
     _require_node(source_node)
     config = config or BridgeConfig.load()
     os.makedirs(config.bridge_dir, exist_ok=True)
     os.makedirs(config.output_dir, exist_ok=True)
+    with MaskNetwork(source_node, mask_node, config.mask_input_layer) as mask:
+        return _export_with_mask(source_node, config, use_cache, mask)
 
+
+def _export_with_mask(source_node, config, use_cache, mask):
     info = heightfield_info(source_node)
     gaea_width, gaea_height, gaea_source = gaea_world_size(config)
     encoding = height_encoding(
@@ -1201,13 +1742,14 @@ def export_for_gaea(source_node, config=None, use_cache=True):
     # Heights + how they're encoded for Gaea + how Gaea will build them.
     content_hash = hashlib.sha1((
         info["content_hash"] + _normalise_dict(encoding)
-        + _normalise_dict(build_settings(config))
+        + _normalise_dict(build_settings(config)) + mask.content_hash()
     ).encode("utf-8")).hexdigest()
     signature = compute_signature(
         config.input_path, config.downsample, config.output_maps, content_hash
     )
 
-    if use_cache and is_cache_valid(config, content_hash):
+    if use_cache and os.path.isfile(config.mask_input_path) and \
+            is_cache_valid(config, content_hash):
         return {
             "input": config.input_path,
             "signature": signature,
@@ -1218,7 +1760,13 @@ def export_for_gaea(source_node, config=None, use_cache=True):
         }
 
     _export_heightfield(source_node, config.input_path, encoding, image_size)
+    coverage = mask.coverage()
+    _export_heightfield(mask.output, config.mask_input_path,
+                        {"offset": 0.0, "span": 1.0, "max_value": 1.0}, image_size,
+                        layer="mask", verify=False)
+    mask_info = dict(mask.info, file=config.mask_input_name, coverage=coverage)
     write_manifest(config, signature, extra={
+        "mask": mask_info,
         "height_range": [info["min"], info["max"]],
         "houdini_width": info["width"],
         "houdini_resolution": list(info["resolution"]),
@@ -1228,7 +1776,12 @@ def export_for_gaea(source_node, config=None, use_cache=True):
         "height_encoding": encoding,
     })
 
-    notes = []
+    notes = ["Mask: {} ({:.0%} of the terrain).".format(
+        mask_info.get("layer") and "layer '{}'".format(mask_info["layer"])
+        or mask_info["source"], coverage)]
+    if mask.mask_input is not None and coverage < 1e-4:
+        notes.append("WARNING: the mask is empty here; Gaea won't change anything. "
+                     "Check that it overlaps the terrain.")
     if info["max"] - info["min"] < 1e-6:
         notes.append("WARNING: source terrain is flat.")
     if encoding["max_value"] > 1.0:
@@ -1318,6 +1871,122 @@ def open_in_gaea(config=None):
 
 
 # --------------------------------------------------------------------------- #
+# Shared paths and project auto-detection (pure logic)
+# --------------------------------------------------------------------------- #
+
+# Paths that are the same for every bridge node of a user: set on one node, they
+# are saved to the user settings and used by every node whose own field is empty.
+SHARED_PATH_KEYS = ("gaea_exe", "gaea_swarm", "gaea_projects_dir")
+USER_SETTINGS_NAME = "gh_bridge_user_settings.json"
+
+
+def user_settings_path():
+    """The per-user settings file: in Houdini's user preferences folder when
+    there is one, else in the home folder."""
+    pref = os.environ.get("HOUDINI_USER_PREF_DIR", "")
+    try:
+        import hou
+        pref = hou.text.expandString("$HOUDINI_USER_PREF_DIR") or pref
+    except ImportError:
+        pass
+    if pref and os.path.isdir(pref):
+        return os.path.join(pref, USER_SETTINGS_NAME)
+    return os.path.join(os.path.expanduser("~"), USER_SETTINGS_NAME)
+
+
+def load_shared_paths(path=None):
+    """{key: path} of the shared paths saved for this user (missing file = {})."""
+    try:
+        with open(path or user_settings_path(), "r", encoding="utf-8") as handle:
+            data = json.load(handle) or {}
+    except (OSError, ValueError):
+        return {}
+    return {key: str(data[key]) for key in SHARED_PATH_KEYS if data.get(key)}
+
+
+def save_shared_paths(values, path=None):
+    """Save the non-empty shared paths in ``values`` for every bridge node; empty
+    ones leave the saved value alone. Returns what is saved now."""
+    path = path or user_settings_path()
+    data = {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle) or {}
+    except (OSError, ValueError):
+        pass
+    for key in SHARED_PATH_KEYS:
+        value = str(values.get(key) or "").strip()
+        if value:
+            data[key] = value
+    folder = os.path.dirname(path)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2)
+    return {key: data[key] for key in SHARED_PATH_KEYS if data.get(key)}
+
+
+def apply_shared_paths(config, shared=None):
+    """Fill the config's empty shared paths from the saved ones. Returns the keys
+    that were filled."""
+    shared = load_shared_paths() if shared is None else shared
+    filled = []
+    for key in SHARED_PATH_KEYS:
+        if not getattr(config, key) and shared.get(key):
+            setattr(config, key, shared[key])
+            filled.append(key)
+    return filled
+
+
+def project_name_for_kind(kind):
+    """The project file name a bridge node looks for first: erosion2.terrain for
+    Erosion2, erosion.terrain for Erosion."""
+    return kind.lower() + ".terrain"
+
+
+def find_project_for_kind(folder, kind):
+    """The Gaea project for an erosion node ``kind`` in ``folder`` and its
+    subfolders: a file named <kind>.terrain, else the first (sorted) .terrain
+    holding a node of that kind. The bridge's own build copy is skipped. None
+    when there is none."""
+    if not folder or not os.path.isdir(folder):
+        return None
+    wanted = project_name_for_kind(kind).casefold()
+    skip = TEMPLATE_BUILD_NAME.casefold()
+    candidates = []
+    for root, dirs, files in os.walk(folder):
+        dirs.sort()
+        for name in sorted(files):
+            lower = name.casefold()
+            if lower.endswith(".terrain") and lower != skip:
+                candidates.append(os.path.join(root, name))
+    for path in candidates:
+        if os.path.basename(path).casefold() == wanted:
+            return path
+    for path in candidates:
+        try:
+            if _collect_nodes(_load_project(path), kind, []):
+                return path
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def resolve_project(config):
+    """Fill an empty ``config.gaea_project`` with the project found for its
+    erosion kind in Gaea Projects Dir (without one: next to this module).
+    Returns ``(how, where)``: ("set", path), ("auto", path) or ("none", folder)."""
+    if config.gaea_project:
+        return "set", config.gaea_project
+    folder = config.gaea_projects_dir or os.path.dirname(os.path.abspath(__file__))
+    found = find_project_for_kind(folder, config.erosion_kind)
+    if found:
+        config.gaea_project = found
+        return "auto", found
+    return "none", folder
+
+
+# --------------------------------------------------------------------------- #
 # HDA integration
 # --------------------------------------------------------------------------- #
 
@@ -1342,40 +2011,54 @@ def overrides_from_node(node):
     return {
         "bridge_dir": _eval("bridge_dir", None, as_string=True) or None,
         "downsample": int(downsample) if downsample else None,
-        "gaea_project": _eval("gaea_project", None, as_string=True),
-        "gaea_exe": _eval("gaea_exe", None, as_string=True),
+        "gaea_project": _eval("gaea_project", None, as_string=True) or None,
+        "gaea_projects_dir": _eval("gaea_projects_dir", None, as_string=True) or None,
+        "gaea_exe": _eval("gaea_exe", None, as_string=True) or None,
         "gaea_width": _eval("gaea_width", None),
         "gaea_height": _eval("gaea_height", None),
         "mask_layer": mask_layer,
+        "mask_input_layer": _eval("mask_input_layer", None, as_string=True) or None,
         "gaea_swarm": _eval("gaea_swarm", None, as_string=True) or None,
         "build_resolution": _int_or_none(_eval("build_resolution", None, as_string=True)),
         "ignore_cache": _bool_or_none(_eval("ignore_cache", None)),
         "show_console": _bool_or_none(_eval("show_console", None)),
         "use_template": _bool_or_none(_eval("use_template", None)),
         "erosion_node": _eval("erosion_node", None, as_string=True),
+        "erosion_kind": node_erosion_kind(node),
         "erosion_params": _erosion_params_from_node(node) or None,
+        "build_tint": _bool_or_none(_eval("build_tint", None)),
     }
 
 
 EROSION_PARM_PREFIX = "ero_"
 
 
+def node_erosion_kind(node):
+    """The Gaea erosion node a bridge HDA drives ("Erosion2" or "Erosion"), from
+    its hidden erosion_kind parameter; older HDAs without it are Erosion2."""
+    parm = node.parm("erosion_kind")
+    kind = parm.evalAsString() if parm is not None else ""
+    return kind if kind in EROSION_SPECS else "Erosion2"
+
+
 def _erosion_params_from_node(node):
     """{Gaea property: value} from the node's ero_* parameters (missing ones are
     skipped)."""
     values = {}
-    for name in EROSION2_DEFAULTS:
+    for name, kind in erosion_types(node_erosion_kind(node)).items():
         parm = node.parm(EROSION_PARM_PREFIX + name)
         if parm is not None:
-            values[name] = _coerce(name, parm.eval())
+            values[name] = _coerce_kind(
+                kind, parm.evalAsString() if kind == "enum" else parm.eval())
     return values
 
 
 def read_template_into_node(node, defaults=False):
     """Fill the node's Erosion parameters from its template project (or with Gaea's
     defaults). Returns a status message."""
+    erosion_kind = node_erosion_kind(node)
     if defaults:
-        values = dict(EROSION2_DEFAULTS)
+        values = dict(erosion_defaults(erosion_kind))
         source = "Gaea defaults"
     else:
         config = config_from_node(node)
@@ -1383,7 +2066,8 @@ def read_template_into_node(node, defaults=False):
             message = "Set Gaea Project on the Paths tab to read the template."
             _set_status(node, message)
             return message
-        values = read_erosion_params(config.gaea_project, config.erosion_node)
+        values = read_erosion_params(config.gaea_project, config.erosion_node,
+                                     erosion_kind)
         source = os.path.basename(config.gaea_project)
     for name, value in values.items():
         parm = node.parm(EROSION_PARM_PREFIX + name)
@@ -1408,6 +2092,66 @@ def on_template_toggled(node):
     return None
 
 
+def refresh_viewport():
+    """Redraw the scene viewers. Never runs "glcache -c": the viewport draws
+    HeightFields from textures too, and an unchanged terrain isn't uploaded again,
+    so it vanishes. New tint maps get new file names instead (tint_display_path)."""
+    import hou
+
+    if not hou.isUIAvailable():
+        return
+    try:
+        for pane in hou.ui.paneTabs():
+            if pane.type() == hou.paneTabType.SceneViewer:
+                for viewport in pane.viewports():
+                    viewport.draw()
+    except Exception:  # noqa: BLE001 - a redraw is only a nicety
+        pass
+
+
+def _set_tint_display(node, shown):
+    """Put the Tint map into the Terrain output's mask (or take it off), recook
+    and redraw."""
+    _set_parm_if_present(node, "show_tint", int(bool(shown)))
+    node.cook(force=True)
+    refresh_viewport()
+
+
+def show_tint(node, show):
+    """Show (or hide) the built Tint map on the Terrain output as its mask
+    (luminance of the color map, drawn like Show Mask).
+
+    Showing re-reads the map from the output folder under a new file name, so
+    it is always the last import's map. Returns the status message.
+    """
+    if not show:
+        _set_tint_display(node, False)
+        message = "Tint hidden."
+        _set_status(node, message)
+        return message
+    config = config_from_node(node)
+    source = find_tint_file(config) if node.evalParm("_imported") else None
+    if source is None:
+        _set_parm_if_present(node, "_tint_file", "")
+        _set_tint_display(node, False)
+        message = ("No tint map imported: turn on Build Tint and build (Export node "
+                   "{!r} in the project).".format(
+                       os.path.splitext(config.tint_output_name)[0]))
+        _set_status(node, message)
+        return message
+    _set_parm_if_present(node, "_tint_file",
+                         tint_display_path(config, source, fresh=True))
+    _set_tint_display(node, True)
+    message = "Tint shown ({}).".format(os.path.basename(source).strip())
+    _set_status(node, message)
+    return message
+
+
+def toggle_tint(node):
+    """Show / Hide Tint button."""
+    return show_tint(node, not node.evalParm("show_tint"))
+
+
 def _int_or_none(value):
     try:
         return int(value)
@@ -1420,8 +2164,69 @@ def _bool_or_none(value):
 
 
 def config_from_node(node):
-    """Build a BridgeConfig for an HDA node: defaults -> JSON file -> node parms."""
-    return BridgeConfig.load(overrides=overrides_from_node(node))
+    """Build a BridgeConfig for an HDA node: defaults -> JSON file -> node parms,
+    then the shared paths for empty fields and the auto-found project."""
+    config = BridgeConfig.load(overrides=overrides_from_node(node))
+    apply_shared_paths(config)
+    resolve_project(config)
+    return config
+
+
+def on_shared_path_changed(node):
+    """Callback of Gaea Exe / Gaea Swarm Exe / Gaea Projects Dir: save them for
+    every bridge node, then show the paths in effect."""
+    values = {}
+    for key in SHARED_PATH_KEYS:
+        parm = node.parm(key)
+        values[key] = parm.evalAsString() if parm is not None else ""
+    save_shared_paths(values)
+    return show_paths(node, "Saved for all bridge nodes.  ")
+
+
+def show_paths(node, prefix=""):
+    """Check Paths: the paths this node will use, with where they come from."""
+    config = BridgeConfig.load(overrides=overrides_from_node(node))
+    filled = apply_shared_paths(config)
+    how, where = resolve_project(config)
+
+    def entry(label, path, key=None):
+        if not path:
+            return "{}: not set".format(label)
+        origin = " (shared)" if key in filled else ""
+        missing = "" if os.path.isfile(path) else "  MISSING"
+        return "{}: {}{}{}".format(label, path, origin, missing)
+
+    parts = [entry("Gaea Exe", config.gaea_exe, "gaea_exe"),
+             entry("Swarm", swarm_exe_path(config),
+                   "gaea_swarm" if config.gaea_swarm else "gaea_exe")]
+    if how == "set":
+        parts.append(entry("Project", where))
+    elif how == "auto":
+        parts.append("Project: {} (found for {} in {})".format(
+            where, config.erosion_kind, config.gaea_projects_dir or "the module folder"))
+    else:
+        parts.append("Project: none found for {} in {}. Put {} there (or any project "
+                     "with an {} node), or set Gaea Project.".format(
+                         config.erosion_kind, where,
+                         project_name_for_kind(config.erosion_kind), config.erosion_kind))
+    message = prefix + "  ".join(parts)
+    _set_parm_if_present(node, "_status_paths", message)
+    return message
+
+
+def node_input(node, index):
+    """The node wired into input ``index``, or None."""
+    inputs = node.inputs()
+    return inputs[index] if index < len(inputs) else None
+
+
+def export_from_node(node, use_cache=True):
+    """Export the HDA node's first input (terrain) and second input (mask)."""
+    source = node_input(node, 0)
+    if source is None:
+        raise RuntimeError("Connect a HeightField into the Gaea Erosion2 Bridge input.")
+    return export_for_gaea(source, config_from_node(node), use_cache=use_cache,
+                           mask_node=node_input(node, 1))
 
 
 # Nodes the pre-HDA import created next to the bridge node; superseded by the
@@ -1457,7 +2262,7 @@ def import_into_node(node, config=None, set_display=True):
 
     if node.parm("_imported") is None:
         raise RuntimeError(
-            "{} is not an up-to-date Gaea Erosion Bridge node. Rebuild the HDA "
+            "{} is not an up-to-date Gaea Erosion2 Bridge node. Rebuild the HDA "
             "(build_gaea_bridge_hda.py).".format(node.path())
         )
     config = config or config_from_node(node)
@@ -1476,7 +2281,7 @@ def import_into_node(node, config=None, set_display=True):
         )
     stamp = output_stamp(config)
 
-    with hou.undos.group("Gaea Erosion Bridge: import"):
+    with hou.undos.group("Gaea Erosion2 Bridge: import"):
         _set_parm_if_present(node, "_import_stamp", stamp)
         for layer in layers:
             node.parm("_{}_file".format(layer)).set(found[layer] or "")
@@ -1485,6 +2290,12 @@ def import_into_node(node, config=None, set_display=True):
         node.parm("_enc_span").set(float(encoding.get("span", 0.0)))
         node.parm("_enc_offset").set(float(encoding.get("offset", 0.0)))
         node.parm("_houdini_width").set(float(manifest.get("houdini_width") or 0.0))
+        tint = find_tint_file(config)
+        # A per-build file name, so the viewport loads the new map by itself.
+        _set_parm_if_present(node, "_tint_file",
+                             tint_display_path(config, tint) if tint else "")
+        if not tint:
+            _set_parm_if_present(node, "show_tint", 0)
         node.parm("_imported").set(1)
 
         # Same path as last time -> make the file nodes re-read the new build.
@@ -1515,10 +2326,12 @@ def import_into_node(node, config=None, set_display=True):
     message = import_message(
         imported, skipped, peaks, "", bool(encoding.get("span"))
     )
+    if tint:
+        message += "  Tint map loaded (Tint tab > Show / Hide Tint)."
     if removed:
         message += "  Removed old import nodes: {}.".format(", ".join(removed))
     return {"node": node, "imported": imported, "skipped": skipped,
-            "mask_peaks": peaks, "message": message}
+            "mask_peaks": peaks, "tint": tint, "message": message}
 
 
 def clear_node_import(node):
@@ -1533,6 +2346,8 @@ def clear_node_import(node):
     _set_parm_if_present(node, "_import_stamp", "")
     for layer in ("height",) + MASK_LAYERS:
         node.parm("_{}_file".format(layer)).set("")
+    _set_parm_if_present(node, "_tint_file", "")
+    _set_parm_if_present(node, "show_tint", 0)
 
 
 # --------------------------------------------------------------------------- #
@@ -1694,7 +2509,7 @@ def is_building(node):
     return entry is not None and entry["job"].poll() is None
 
 
-STATUS_PARMS = ("_status", "_status_erosion")  # Bridge tab, Erosion tab
+STATUS_PARMS = ("_status", "_status_erosion", "_status_tint")  # per tab
 
 
 def set_status(node, message):
@@ -1731,13 +2546,23 @@ def _finish_build(node, job, then_import):
     return ok, message
 
 
-def build_in_gaea(node, then_import=None, wait=None):
+def _call_done(on_done, ok):
+    if on_done is not None:
+        try:
+            on_done(ok)
+        except Exception:  # a finished build must never raise from here
+            pass
+
+
+def build_in_gaea(node, then_import=None, wait=None, on_done=None):
     """Build the node's Gaea project with Gaea.Swarm.exe, then import the result.
 
     ``then_import`` None follows the node's Auto Import After Build toggle. In the
     Houdini UI the build runs in the background: Status shows the elapsed time and
     the import happens when Swarm exits. Without a UI (hython) it blocks until
-    done. Returns the SwarmBuild, or None when the build couldn't start.
+    done. ``on_done(ok)`` is called once the build is over (also when it couldn't
+    start, failed or was cancelled). Returns the SwarmBuild, or None when the
+    build couldn't start.
     """
     import hou
 
@@ -1746,27 +2571,34 @@ def build_in_gaea(node, then_import=None, wait=None):
         then_import = True if parm is None else bool(parm.eval())
     if is_building(node):
         _set_status(node, "A Gaea build is already running for this node.")
+        _call_done(on_done, False)
         return None
     config = config_from_node(node)
     problems = validate_build(config)
     if problems:
         _set_status(node, "Cannot build: " + "  ".join(problems))
+        _call_done(on_done, False)
         return None
 
     note = ""
     command = None
-    if config.use_template:
+    if config.builds_copy:
         copy = template_build_path(config)
         changed = write_template_copy(config, copy)
         command = swarm_command(config, project=copy)
-        note = " (template; changed: {})".format(", ".join(changed) or "nothing")
+        note = " (copy; changed: {})".format(", ".join(changed) or "nothing")
     job = SwarmBuild(config, command=command).start()
     job.note = note
+    job.on_done = on_done
     if wait is None:
         wait = not hou.isUIAvailable()
     if wait:
         job.wait()
-        _finish_build(node, job, then_import)
+        ok = False
+        try:
+            ok, _ = _finish_build(node, job, then_import)
+        finally:
+            _call_done(on_done, ok)
         return job
 
     key = node.sessionId()
@@ -1788,11 +2620,14 @@ def build_in_gaea(node, then_import=None, wait=None):
                 job.note, job.elapsed))
             return
         _stop_build_watch(key)
+        ok = False
         try:
-            _finish_build(target, job, then_import)
+            ok, _ = _finish_build(target, job, then_import)
         except Exception as error:
             _set_status(target, "Gaea build finished, but import failed: {}".format(
                 error))
+        finally:
+            _call_done(job.on_done, ok)
 
     _build_registry()[key] = {"job": job, "callback": tick}
     hou.ui.addEventLoopCallback(tick)
@@ -1813,34 +2648,143 @@ def _stop_build_watch(key):
 
 
 def cancel_build(node):
-    """Stop the node's running Swarm build, if any."""
+    """Stop the node's running Swarm build (or a pending auto rebuild) and unlock."""
+    _cancel_pending_rebuild(node.sessionId())
     entry = _stop_build_watch(node.sessionId())
     if entry is None or entry["job"].poll() is not None:
+        set_locked(node, False)
         _set_status(node, "No Gaea build is running.")
         return False
     entry["job"].cancel()
+    _call_done(getattr(entry["job"], "on_done", None), False)
+    set_locked(node, False)
     _set_status(node, "Gaea build cancelled after {:.0f} s.".format(
         entry["job"].elapsed))
     return True
 
 
-def run_full_cycle(node, wait=None):
+def run_full_cycle(node, wait=None, on_done=None):
     """Export -> build in Gaea (Swarm) -> import, all from the node.
 
     When the export cache says nothing changed and the outputs exist, the build is
-    skipped and the existing outputs are imported.
+    skipped and the existing outputs are imported. ``on_done(ok)`` is called when
+    everything is over (see ``build_in_gaea``).
     """
-    source = node.inputs()[0] if node.inputs() else None
-    if source is None:
-        raise RuntimeError("Connect a HeightField into the Gaea Erosion Bridge input.")
-    config = config_from_node(node)
-    export = export_for_gaea(source, config)
-    if export["cache_hit"]:
-        result = import_into_node(node, config)
-        _set_status(node, "Nothing changed since the last build.  " + result["message"])
-        return None
+    try:
+        export = export_from_node(node)
+        config = config_from_node(node)
+        if export["cache_hit"]:
+            result = import_into_node(node, config)
+            _set_status(node, "Nothing changed since the last build.  "
+                        + result["message"])
+            _call_done(on_done, True)
+            return None
+    except Exception:
+        _call_done(on_done, False)
+        raise
     _set_status(node, export["message"])
-    return build_in_gaea(node, then_import=True, wait=wait)
+    return build_in_gaea(node, then_import=True, wait=wait, on_done=on_done)
+
+
+# --------------------------------------------------------------------------- #
+# Auto Build on Change (Erosion tab) and node locking
+# --------------------------------------------------------------------------- #
+
+AUTO_REBUILD_DELAY = 0.75  # s after the last change (a slider drag fires many)
+
+
+def set_locked(node, locked):
+    """Lock or unlock every parameter of the node (they are disabled while the
+    hidden _locked toggle is on; Cancel Build stays available)."""
+    import hou
+
+    try:
+        parm = node.parm("_locked")
+        if parm is not None:
+            parm.set(1 if locked else 0)
+    except hou.ObjectWasDeleted:
+        pass
+
+
+def _pending_registry():
+    import hou
+
+    registry = getattr(hou.session, "_ghb_pending_rebuilds", None)
+    if registry is None:
+        registry = {}
+        hou.session._ghb_pending_rebuilds = registry
+    return registry
+
+
+def _cancel_pending_rebuild(key):
+    import hou
+
+    entry = _pending_registry().pop(key, None)
+    if entry and hou.isUIAvailable():
+        try:
+            hou.ui.removeEventLoopCallback(entry["callback"])
+        except hou.OperationFailed:
+            pass
+    return entry is not None
+
+
+def _start_auto_rebuild(node):
+    import hou
+
+    key = node.sessionId()
+
+    def done(ok):
+        target = hou.nodeBySessionId(key)
+        if target is not None:
+            set_locked(target, False)
+
+    try:
+        run_full_cycle(node, on_done=done)
+    except Exception as error:
+        set_locked(node, False)
+        _set_status(node, "Auto build failed: {}".format(error))
+
+
+def on_erosion_parm_changed(node):
+    """Callback of every Erosion parameter and of Build Tint: with Auto Build on
+    Change, lock the node and run Export > Build > Import once the values stop
+    changing."""
+    import hou
+
+    toggle = node.parm("auto_rebuild")
+    if toggle is None or not toggle.eval() or not node.evalParm("use_template"):
+        return False
+    set_locked(node, True)
+    if not hou.isUIAvailable():
+        _start_auto_rebuild(node)
+        return True
+
+    key = node.sessionId()
+    registry = _pending_registry()
+    due = time.monotonic() + AUTO_REBUILD_DELAY
+    if key in registry:
+        registry[key]["due"] = due
+        return True
+
+    def tick():
+        entry = registry.get(key)
+        if entry is None or time.monotonic() < entry["due"]:
+            return
+        _cancel_pending_rebuild(key)
+        target = hou.nodeBySessionId(key)
+        if target is not None:
+            _start_auto_rebuild(target)
+
+    registry[key] = {"due": due, "callback": tick}
+    hou.ui.addEventLoopCallback(tick)
+    _set_status(node, "Erosion changed: rebuilding in Gaea. The node is locked until "
+                      "the result is imported.")
+    return True
+
+
+def unlock_after_load(node):
+    """Builds don't survive closing a scene: never reopen a node locked."""
+    set_locked(node, False)
 
 
 def sync_auto_import(node):
