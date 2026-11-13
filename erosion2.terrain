@@ -19,8 +19,8 @@
               "Name": "File",
               "Position": {
                 "$id": "7",
-                "X": 25195.445,
-                "Y": 26153.656
+                "X": 24557.086,
+                "Y": 26143.156
               },
               "Ports": {
                 "$id": "8",
@@ -53,8 +53,9 @@
             "363": {
               "$id": "12",
               "$type": "QuadSpinner.Gaea.Nodes.Erosion2, Gaea.Nodes",
+              "Duration": 26.453722,
               "Downcutting": 0.55349267,
-              "ErosionScale": 289.51,
+              "ErosionScale": 727.5808,
               "Seed": 13864,
               "SuspendedLoadDischargeAngle": 31.41553,
               "BedLoadDischargeAmount": 0.40270796,
@@ -64,8 +65,8 @@
               "NodeSize": "Standard",
               "Position": {
                 "$id": "13",
-                "X": 25590.764,
-                "Y": 26176.21
+                "X": 24952.404,
+                "Y": 26165.71
               },
               "Ports": {
                 "$id": "14",
@@ -165,8 +166,8 @@
               "Name": "output_height",
               "Position": {
                 "$id": "26",
-                "X": 26629.514,
-                "Y": 25783.33
+                "X": 26621.576,
+                "Y": 26028.055
               },
               "Ports": {
                 "$id": "27",
@@ -214,8 +215,8 @@
               "NodeSize": "Standard",
               "Position": {
                 "$id": "33",
-                "X": 26629.514,
-                "Y": 25882.805
+                "X": 26621.576,
+                "Y": 26127.53
               },
               "Ports": {
                 "$id": "34",
@@ -263,8 +264,8 @@
               "NodeSize": "Standard",
               "Position": {
                 "$id": "40",
-                "X": 26629.514,
-                "Y": 26000.87
+                "X": 26621.576,
+                "Y": 26244.932
               },
               "Ports": {
                 "$id": "41",
@@ -312,8 +313,8 @@
               "NodeSize": "Standard",
               "Position": {
                 "$id": "47",
-                "X": 26629.514,
-                "Y": 26112.285
+                "X": 26621.576,
+                "Y": 26357.01
               },
               "Ports": {
                 "$id": "48",
@@ -359,8 +360,8 @@
               "Name": "File",
               "Position": {
                 "$id": "54",
-                "X": 25195.445,
-                "Y": 26276.719
+                "X": 24557.086,
+                "Y": 26266.219
               },
               "Ports": {
                 "$id": "55",
@@ -397,8 +398,8 @@
               "Name": "Tint",
               "Position": {
                 "$id": "60",
-                "X": 26339.576,
-                "Y": 26220.21
+                "X": 25661.984,
+                "Y": 26433.7
               },
               "Ports": {
                 "$id": "61",
@@ -436,17 +437,15 @@
                 "$values": []
               }
             },
-            "118": {
+            "646": {
               "$id": "66",
-              "$type": "QuadSpinner.Gaea.Nodes.Export, Gaea.Nodes",
-              "Location": "Custom",
-              "OutputPath": "C:\\Temp\\gh_bridge\\output",
-              "Id": 118,
-              "Name": " output_tint_height",
+              "$type": "QuadSpinner.Gaea.Nodes.Tint, Gaea.Nodes",
+              "Id": 646,
+              "Name": "Tint",
               "Position": {
                 "$id": "67",
-                "X": 26623.496,
-                "Y": 26219.686
+                "X": 25662.87,
+                "Y": 26557.504
               },
               "Ports": {
                 "$id": "68",
@@ -457,9 +456,9 @@
                     "Type": "PrimaryIn, Required",
                     "Record": {
                       "$id": "70",
-                      "From": 854,
-                      "To": 118,
-                      "FromPort": "Out",
+                      "From": 363,
+                      "To": 646,
+                      "FromPort": "Flow",
                       "ToPort": "In",
                       "IsValid": true
                     },
@@ -484,15 +483,15 @@
                 "$values": []
               }
             },
-            "646": {
+            "434": {
               "$id": "73",
               "$type": "QuadSpinner.Gaea.Nodes.Tint, Gaea.Nodes",
-              "Id": 646,
+              "Id": 434,
               "Name": "Tint",
               "Position": {
                 "$id": "74",
-                "X": 26340.46,
-                "Y": 26344.016
+                "X": 25662.969,
+                "Y": 26688.305
               },
               "Ports": {
                 "$id": "75",
@@ -504,8 +503,8 @@
                     "Record": {
                       "$id": "77",
                       "From": 363,
-                      "To": 646,
-                      "FromPort": "Flow",
+                      "To": 434,
+                      "FromPort": "Wear",
                       "ToPort": "In",
                       "IsValid": true
                     },
@@ -530,18 +529,20 @@
                 "$values": []
               }
             },
-            "621": {
+            "367": {
               "$id": "80",
               "$type": "QuadSpinner.Gaea.Nodes.Export, Gaea.Nodes",
               "Location": "Custom",
               "OutputPath": "C:\\Temp\\gh_bridge\\output",
-              "Id": 621,
-              "Name": " output_tint_flow",
+              "Id": 367,
+              "Name": " output_tint_combine",
+              "NodeSize": "Standard",
               "Position": {
                 "$id": "81",
-                "X": 26624.38,
-                "Y": 26343.49
+                "X": 26455.383,
+                "Y": 26557.504
               },
+              "RenderIntentOverride": "Color",
               "Ports": {
                 "$id": "82",
                 "$values": [
@@ -551,8 +552,8 @@
                     "Type": "PrimaryIn, Required",
                     "Record": {
                       "$id": "84",
-                      "From": 646,
-                      "To": 621,
+                      "From": 567,
+                      "To": 367,
                       "FromPort": "Out",
                       "ToPort": "In",
                       "IsValid": true
@@ -578,15 +579,15 @@
                 "$values": []
               }
             },
-            "434": {
+            "847": {
               "$id": "87",
               "$type": "QuadSpinner.Gaea.Nodes.Tint, Gaea.Nodes",
-              "Id": 434,
+              "Id": 847,
               "Name": "Tint",
               "Position": {
                 "$id": "88",
-                "X": 26340.56,
-                "Y": 26474.816
+                "X": 25660.48,
+                "Y": 26800.21
               },
               "Ports": {
                 "$id": "89",
@@ -598,8 +599,8 @@
                     "Record": {
                       "$id": "91",
                       "From": 363,
-                      "To": 434,
-                      "FromPort": "Wear",
+                      "To": 847,
+                      "FromPort": "Deposits",
                       "ToPort": "In",
                       "IsValid": true
                     },
@@ -624,18 +625,22 @@
                 "$values": []
               }
             },
-            "721": {
+            "567": {
               "$id": "94",
-              "$type": "QuadSpinner.Gaea.Nodes.Export, Gaea.Nodes",
-              "Location": "Custom",
-              "OutputPath": "C:\\Temp\\gh_bridge\\output",
-              "Id": 721,
-              "Name": " output_tint_wear",
+              "$type": "QuadSpinner.Gaea.Nodes.Combine, Gaea.Nodes",
+              "PortCount": 4,
+              "Ratio": 1.0,
+              "Mode": "Multiply",
+              "Enhance": "Equalize",
+              "Id": 567,
+              "Name": "Combine",
+              "NodeSize": "Standard",
               "Position": {
                 "$id": "95",
-                "X": 26624.48,
-                "Y": 26474.291
+                "X": 26072.512,
+                "Y": 26557.504
               },
+              "RenderIntentOverride": "Color",
               "Ports": {
                 "$id": "96",
                 "$values": [
@@ -645,8 +650,8 @@
                     "Type": "PrimaryIn, Required",
                     "Record": {
                       "$id": "98",
-                      "From": 434,
-                      "To": 721,
+                      "From": 854,
+                      "To": 567,
                       "FromPort": "Out",
                       "ToPort": "In",
                       "IsValid": true
@@ -664,51 +669,65 @@
                     "Parent": {
                       "$ref": "94"
                     }
-                  }
-                ]
-              },
-              "Modifiers": {
-                "$id": "100",
-                "$values": []
-              }
-            },
-            "847": {
-              "$id": "101",
-              "$type": "QuadSpinner.Gaea.Nodes.Tint, Gaea.Nodes",
-              "Id": 847,
-              "Name": "Tint",
-              "Position": {
-                "$id": "102",
-                "X": 26338.072,
-                "Y": 26586.723
-              },
-              "Ports": {
-                "$id": "103",
-                "$values": [
+                  },
                   {
-                    "$id": "104",
-                    "Name": "In",
-                    "Type": "PrimaryIn, Required",
+                    "$id": "100",
+                    "Name": "Input2",
+                    "Type": "In",
                     "Record": {
-                      "$id": "105",
-                      "From": 363,
-                      "To": 847,
-                      "FromPort": "Deposits",
-                      "ToPort": "In",
+                      "$id": "101",
+                      "From": 646,
+                      "To": 567,
+                      "FromPort": "Out",
+                      "ToPort": "Input2",
                       "IsValid": true
                     },
                     "IsExporting": true,
                     "Parent": {
-                      "$ref": "101"
+                      "$ref": "94"
                     }
                   },
                   {
-                    "$id": "106",
-                    "Name": "Out",
-                    "Type": "PrimaryOut",
+                    "$id": "102",
+                    "Name": "Mask",
+                    "Type": "In",
                     "IsExporting": true,
                     "Parent": {
-                      "$ref": "101"
+                      "$ref": "94"
+                    }
+                  },
+                  {
+                    "$id": "103",
+                    "Name": "Input3",
+                    "Type": "In",
+                    "Record": {
+                      "$id": "104",
+                      "From": 434,
+                      "To": 567,
+                      "FromPort": "Out",
+                      "ToPort": "Input3",
+                      "IsValid": true
+                    },
+                    "IsExporting": true,
+                    "Parent": {
+                      "$ref": "94"
+                    }
+                  },
+                  {
+                    "$id": "105",
+                    "Name": "Input4",
+                    "Type": "In",
+                    "Record": {
+                      "$id": "106",
+                      "From": 847,
+                      "To": 567,
+                      "FromPort": "Out",
+                      "ToPort": "Input4",
+                      "IsValid": true
+                    },
+                    "IsExporting": true,
+                    "Parent": {
+                      "$ref": "94"
                     }
                   }
                 ]
@@ -717,74 +736,26 @@
                 "$id": "107",
                 "$values": []
               }
-            },
-            "101": {
-              "$id": "108",
-              "$type": "QuadSpinner.Gaea.Nodes.Export, Gaea.Nodes",
-              "Location": "Custom",
-              "OutputPath": "C:\\Temp\\gh_bridge\\output",
-              "Id": 101,
-              "Name": " output_tint_sediment",
-              "Position": {
-                "$id": "109",
-                "X": 26621.992,
-                "Y": 26586.197
-              },
-              "Ports": {
-                "$id": "110",
-                "$values": [
-                  {
-                    "$id": "111",
-                    "Name": "In",
-                    "Type": "PrimaryIn, Required",
-                    "Record": {
-                      "$id": "112",
-                      "From": 847,
-                      "To": 101,
-                      "FromPort": "Out",
-                      "ToPort": "In",
-                      "IsValid": true
-                    },
-                    "IsExporting": true,
-                    "Parent": {
-                      "$ref": "108"
-                    }
-                  },
-                  {
-                    "$id": "113",
-                    "Name": "Out",
-                    "Type": "PrimaryOut",
-                    "IsExporting": true,
-                    "Parent": {
-                      "$ref": "108"
-                    }
-                  }
-                ]
-              },
-              "Modifiers": {
-                "$id": "114",
-                "$values": []
-              }
             }
           },
           "Groups": {
-            "$id": "115"
+            "$id": "108"
           },
           "Notes": {
-            "$id": "116"
+            "$id": "109"
           },
           "GraphTabs": {
-            "$id": "117",
+            "$id": "110",
             "$values": [
               {
-                "$id": "118",
+                "$id": "111",
                 "Name": "Graph 1",
                 "Color": "Brass",
-                "ZoomFactor": 0.6299605249474372,
+                "ZoomFactor": 0.5000000000000004,
                 "ViewportLocation": {
-                  "$id": "119",
-                  "X": 24654.568,
-                  "Y": 25943.812
+                  "$id": "112",
+                  "X": 24201.988,
+                  "Y": 25886.229
                 }
               }
             ]
@@ -793,52 +764,52 @@
           "Height": 2500.0,
           "Ratio": 0.5,
           "Regions": {
-            "$id": "120",
+            "$id": "113",
             "$values": []
           }
         },
         "Automation": {
-          "$id": "121",
+          "$id": "114",
           "Bindings": {
-            "$id": "122",
+            "$id": "115",
             "$values": []
           },
           "Expressions": {
-            "$id": "123"
+            "$id": "116"
           },
           "Variables": {
-            "$id": "124",
+            "$id": "117",
             "OutHeight": {
-              "$id": "125",
+              "$id": "118",
               "Name": "OutHeight",
               "ExtraData": "2"
             },
             "InHeight": {
-              "$id": "126",
+              "$id": "119",
               "Order": 1,
               "Name": "InHeight",
               "ExtraData": "1"
             },
             "OutFlow": {
-              "$id": "127",
+              "$id": "120",
               "Order": 2,
               "Name": "OutFlow",
               "ExtraData": "2"
             },
             "OutWear": {
-              "$id": "128",
+              "$id": "121",
               "Order": 3,
               "Name": "OutWear",
               "ExtraData": "2"
             },
             "OutDeposit": {
-              "$id": "129",
+              "$id": "122",
               "Order": 4,
               "Name": "OutDeposit",
               "ExtraData": "2"
             },
             "Duration": {
-              "$id": "130",
+              "$id": "123",
               "Order": 5,
               "Name": "Duration",
               "Value": 10.0,
@@ -848,7 +819,7 @@
               "Default": 0.0
             },
             "Seed": {
-              "$id": "131",
+              "$id": "124",
               "Order": 6,
               "Name": "Seed",
               "Value": 33285,
@@ -858,7 +829,7 @@
               "Default": 0
             },
             "CoarseSedimentsDischargeAmount": {
-              "$id": "132",
+              "$id": "125",
               "Order": 7,
               "Name": "CoarseSedimentsDischargeAmount",
               "Value": 0.0,
@@ -868,7 +839,7 @@
               "Default": 0.0
             },
             "ShapeSharpness": {
-              "$id": "133",
+              "$id": "126",
               "Order": 8,
               "Name": "ShapeSharpness",
               "Value": 0.6,
@@ -878,7 +849,7 @@
               "Default": 0.0
             },
             "ShapeDetailScale": {
-              "$id": "134",
+              "$id": "127",
               "Order": 9,
               "Name": "ShapeDetailScale",
               "Value": 0.25,
@@ -888,7 +859,7 @@
               "Default": 0.0
             },
             "Duration_363": {
-              "$id": "135",
+              "$id": "128",
               "Order": 15,
               "Name": "Duration_363",
               "Value": 10.0,
@@ -898,7 +869,7 @@
               "Default": 10.0
             },
             "ErosionScale": {
-              "$id": "136",
+              "$id": "129",
               "Order": 16,
               "Name": "ErosionScale",
               "Value": 0.0,
@@ -910,7 +881,7 @@
           }
         },
         "BuildDefinition": {
-          "$id": "137",
+          "$id": "130",
           "Type": "Standard",
           "Destination": "<Builds>\\[Filename]\\[+++]",
           "Resolution": 2048,
@@ -925,18 +896,18 @@
           "PostBuildScript": ""
         },
         "State": {
-          "$id": "138",
+          "$id": "131",
           "BakeResolution": 2048,
           "PreviewResolution": 2048,
-          "SelectedNode": 363,
+          "SelectedNode": 475,
           "NodeBookmarks": {
-            "$id": "139",
+            "$id": "132",
             "$values": []
           },
           "Viewport": {
-            "$id": "140",
+            "$id": "133",
             "Camera": {
-              "$id": "141"
+              "$id": "134"
             },
             "RenderMode": "Realistic",
             "AmbientOcclusion": true,
@@ -944,7 +915,7 @@
           }
         },
         "BuildProfiles": {
-          "$id": "142"
+          "$id": "135"
         }
       }
     ]
@@ -952,18 +923,18 @@
   "Id": "3bb48775",
   "Branch": 1,
   "Macros": {
-    "$id": "143",
+    "$id": "136",
     "$values": []
   },
   "Metadata": {
-    "$id": "144",
+    "$id": "137",
     "Name": "",
     "Description": "",
     "Version": "2.2.0.2",
     "Owner": "",
     "DateCreated": "2026-11-04 13:11:07Z",
     "DateLastBuilt": "2026-11-04 13:11:07Z",
-    "DateLastSaved": "2026-11-13 00:32:46Z",
+    "DateLastSaved": "2026-11-14 01:04:00Z",
     "ModifiedVersion": "2.3.1.0"
   }
 }

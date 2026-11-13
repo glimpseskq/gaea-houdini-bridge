@@ -15,8 +15,8 @@ HeightField ─▶ input_height.exr ─▶ Gaea: File ─▶ Erosion2 ─▶ Exp
 
 - **Одна кнопка**: Export > Build > Import, в фоне.
 - **Четыре выхода**: Terrain, Flow, Wear, Sediment (маски готовы для HeightField-нод).
-- **Параметры Erosion2 и Tint в Houdini**: меняете и пересобираете; сам проект Gaea не
-  меняется (собирается копия).
+- **Параметры Erosion2 / Erosion в Houdini**: меняете и пересобираете; сам проект Gaea
+  не меняется (собирается копия).
 - **Вход маски**: второй вход ограничивает, где Gaea размывает (любая маска или геометрия).
 - **Масштаб 1:1**, разрешение экспорта Full–1/4, сборка до 16K, кэш сборок.
 - Houdini 19.5+ (проверено на 20.5), Gaea 2.3, Windows.
@@ -32,37 +32,45 @@ HeightField ─▶ input_height.exr ─▶ Gaea: File ─▶ Erosion2 ─▶ Exp
    ```python
    exec(open(r"C:/path/to/BridgeHGH/build_gaea_bridge_hda.py").read())
    ```
-   В меню Tab появится нода **Gaea Erosion2 Bridge**.
+   В меню Tab появятся две ноды: **Gaea Erosion2 Bridge** (для проекта с Erosion2) и
+   **Gaea Erosion Bridge** (для старой ноды Erosion). Работают одинаково, у каждой
+   параметры своей ноды.
 
 ## Проект Gaea (один раз)
 
-`File` (`<Bridge Dir>/input_height.exr`) → **Erosion2** → Export-ноды с именами:
+`File` (любой путь, мост выставит сам) → **Erosion2** (или **Erosion**) → Export-ноды
+с именами:
 
 | Выход Erosion2 | Export-нода |
 |----------------|-------------|
 | Out / Flow / Wear / Deposits | `output_height` / `output_flow` / `output_wear` / `output_sediment` |
-| то же через ноду **Tint** | `output_tint_height` / `_flow` / `_wear` / `_sediment` |
+| цветовая карта (ноды Tint → Combine), необязательно | `output_tint_combine` |
 | порт Mask ← вторая `File`-нода | читает `<Bridge Dir>/input_mask.exr` |
 
-У Export-нод: Format EXR, Location Custom, Output Path `<Bridge Dir>/output`. При
-включённых Use Erosion Template или Use Tint Parameters мост выставляет пути сам.
-Сохраните проект.
+Формат экспорта EXR. Мост собирает копию проекта и сам выставляет в ней все пути
+(входной File, File маски, Export-ноды), так что сохранённый проект не меняется и не
+обязан указывать на папку моста. Каждая нода-мост работает в своей папке
+(по умолчанию `C:/Temp/gh_bridge/<имя ноды>`).
 
 ## Использование
 
 1. Подключите к ноде HeightField (и при желании маску).
-2. Вкладка **Paths**: Bridge Dir, Gaea Project (`.terrain`), Gaea Exe.
+2. Вкладка **Paths**, один раз: **Gaea Exe** и **Gaea Projects Dir** (ваша папка с
+   `.terrain`). Оба общие для всех нод-мостов. Проект каждая нода находит там сама
+   (`erosion2.terrain` / `erosion.terrain`, иначе любой проект с такой нодой);
+   **Gaea Project** задавайте только ради конкретного файла. **Check Paths** показывает,
+   что используется.
 3. Нажмите **Export > Build > Import**.
 
 Вкладки:
 
 - **Bridge** — разрешение экспорта, опции сборки, пошаговые кнопки, Auto Import.
-- **Erosion** — *Use Erosion Template* открывает все параметры Erosion2; *Auto Build on
+- **Erosion** — *Use Erosion Template* открывает все параметры ноды эрозии проекта
+  (Erosion2 или Erosion, смотря какая нода-мост); *Auto Build on
   Change* пересобирает после каждой правки (нода заблокирована до импорта).
-- **Tint** — *Use Tint Parameters* открывает Tint каждого слоя. Чтобы увидеть тинт,
-  выберите его в меню **Tint** и нажмите **Load Tint** (повторное нажатие
-  перезагружает; None или **Reset** скрывает). Тинт показывается как маска Terrain
-  (яркость карты).
+- **Tint** — *Build Tint* собирает `output_tint_combine` с настройками Tint из самого
+  проекта; без галки ноды тинта в сборку не попадают вообще. **Show / Hide Tint**
+  показывает карту как маску Terrain (яркость).
 - **Gaea Layers** — превью Show Mask, для каждой маски Normalize / Range / Gamma / Blur,
   Keep Input Resolution.
 
@@ -76,7 +84,7 @@ HeightField ─▶ input_height.exr ─▶ Gaea: File ─▶ Erosion2 ─▶ Exp
 
 ## Ограничения
 
-- Сам граф Gaea редактируется в Gaea; из Houdini меняются только значения Erosion2/Tint.
+- Сам граф Gaea редактируется в Gaea; из Houdini меняются только значения ноды эрозии.
 - Формат `.terrain` не публичный API; новая версия Gaea может потребовать обновления.
 
 ---

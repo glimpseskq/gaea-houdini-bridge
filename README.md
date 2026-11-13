@@ -15,8 +15,8 @@ Terrain + masks ◀── output/output_*.exr ◀──────────�
 
 - **One button**: Export > Build > Import, in the background.
 - **Four outputs**: Terrain, Flow, Wear, Sediment (masks ready for HeightField nodes).
-- **Erosion2 and Tint parameters in Houdini**: change them and rebuild; the Gaea project
-  itself is never modified (a copy is built).
+- **Erosion2 / Erosion parameters in Houdini**: change them and rebuild; the Gaea
+  project itself is never modified (a copy is built).
 - **Mask input**: the second input limits where Gaea erodes (any mask or geometry).
 - **1:1 scale**, export resolution Full–1/4, build resolution up to 16K, build cache.
 - Houdini 19.5+ (tested on 20.5), Gaea 2.3, Windows.
@@ -32,35 +32,45 @@ Terrain + masks ◀── output/output_*.exr ◀──────────�
    ```python
    exec(open(r"C:/path/to/BridgeHGH/build_gaea_bridge_hda.py").read())
    ```
-   A **Gaea Erosion2 Bridge** node appears in the SOP Tab menu.
+   Two nodes appear in the SOP Tab menu: **Gaea Erosion2 Bridge** (for a project
+   with Gaea's Erosion2) and **Gaea Erosion Bridge** (for the older Erosion node).
+   They work the same; each exposes its own node's parameters.
 
 ## Gaea project (once)
 
-`File` (`<Bridge Dir>/input_height.exr`) → **Erosion2** → Export nodes named:
+`File` (any path; the bridge sets it) → **Erosion2** (or **Erosion**) → Export nodes
+named:
 
 | Erosion2 output | Export node |
 |-----------------|-------------|
 | Out / Flow / Wear / Deposits | `output_height` / `output_flow` / `output_wear` / `output_sediment` |
-| same, through a **Tint** node | `output_tint_height` / `_flow` / `_wear` / `_sediment` |
+| color map (Tint nodes → Combine), optional | `output_tint_combine` |
 | Mask port ← second `File` node | loads `<Bridge Dir>/input_mask.exr` |
 
-Exports: Format EXR, Location Custom, Output Path `<Bridge Dir>/output`. With Use Erosion
-Template or Use Tint Parameters on, the bridge sets these paths itself. Save the project.
+Export format EXR. The bridge builds a copy of the project and sets every path in it
+(input File, mask File, Export locations), so the saved project is never modified and
+never has to point at the bridge folder. Each bridge node works in its own folder
+(`C:/Temp/gh_bridge/<node name>` by default).
 
 ## Usage
 
 1. Connect a HeightField (and optionally a mask) to the node.
-2. **Paths** tab: Bridge Dir, Gaea Project (`.terrain`), Gaea Exe.
+2. **Paths** tab, once: **Gaea Exe** and **Gaea Projects Dir** (your folder of
+   `.terrain` files). Both are shared by every bridge node. Each node finds its project
+   there by itself (`erosion2.terrain` / `erosion.terrain`, else any project with that
+   node); set **Gaea Project** only to pick a specific file. **Check Paths** shows what
+   is in use.
 3. Press **Export > Build > Import**.
 
 Tabs:
 
 - **Bridge** — export resolution, build options, step-by-step buttons, Auto Import.
-- **Erosion** — *Use Erosion Template* exposes all Erosion2 parameters; *Auto Build on
+- **Erosion** — *Use Erosion Template* exposes all parameters of the project's erosion
+  node (Erosion2 or Erosion, depending on the bridge node); *Auto Build on
   Change* rebuilds after every edit (the node is locked until the import).
-- **Tint** — *Use Tint Parameters* exposes each layer's Tint. To view a tint, pick it in
-  the **Tint** menu and press **Load Tint** (press again to reload; None or
-  **Reset** hides it). The tint is shown as the Terrain's mask (luminance of the map).
+- **Tint** — *Build Tint* builds `output_tint_combine` with the project's own Tint
+  settings; off, the tint nodes are left out of the build entirely. **Show / Hide Tint**
+  shows the map as the Terrain's mask (luminance).
 - **Gaea Layers** — Show Mask preview, per-mask Normalize / Range / Gamma / Blur,
   Keep Input Resolution.
 
@@ -74,7 +84,7 @@ Tabs:
 
 ## Limitations
 
-- The Gaea graph itself is edited in Gaea; Houdini only changes Erosion2/Tint values.
+- The Gaea graph itself is edited in Gaea; Houdini only changes the erosion node's values.
 - The `.terrain` format isn't a public API; a future Gaea version may need an update.
 
 ---
