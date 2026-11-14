@@ -2608,23 +2608,25 @@ def refresh_viewport():
 
 
 def _set_tint_display(node, shown):
-    """Put the Tint map into the Terrain output's mask (or take it off), recook
-    and redraw."""
+    """Switch the Terrain output to the Tint-colored mesh (or back to the plain
+    HeightField), recook and redraw."""
     _set_parm_if_present(node, "show_tint", int(bool(shown)))
     node.cook(force=True)
     refresh_viewport()
 
 
 def show_tint(node, show):
-    """Show (or hide) the built Tint map on the Terrain output as its mask
-    (luminance of the color map, drawn like Show Mask).
+    """Show (or hide) the built Tint map on the Terrain output: shown, the output
+    is the HeightField converted to polygons with the map as a texture or as
+    point colors (Color Mode / Mesh Resolution on the Tint tab); hidden, the
+    plain HeightField.
 
     Showing re-reads the map from the output folder under a new file name, so
     it is always the last import's map. Returns the status message.
     """
     if not show:
         _set_tint_display(node, False)
-        message = "Tint hidden."
+        message = "Tint hidden: Terrain output is the HeightField again."
         _set_status(node, message)
         return message
     config = config_from_node(node)
@@ -2640,7 +2642,8 @@ def show_tint(node, show):
     _set_parm_if_present(node, "_tint_file",
                          tint_display_path(config, source, fresh=True))
     _set_tint_display(node, True)
-    message = "Tint shown ({}).".format(os.path.basename(source).strip())
+    message = ("Tint shown ({}): Terrain output is now a colored mesh (Color Mode / "
+               "Mesh Resolution on the Tint tab).".format(os.path.basename(source).strip()))
     _set_status(node, message)
     return message
 

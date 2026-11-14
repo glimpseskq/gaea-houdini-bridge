@@ -375,20 +375,17 @@ def _build_network(subnet):
         result = _switch(subnet, name.lower() + "_grid_switch",
                          (result, on_input_grid), 'ch("../keep_input_res")')
         if index == 0:
-            # Show / Hide Tint: the Tint map, converted to luminance, goes into
-            # the Terrain output's "mask" layer and is drawn like Show Mask (a
-            # layer change the viewport always follows). No extra layer.
-            tint = subnet.createNode("heightfield_file", "tint_to_mask")
-            tint.setInput(0, result)
-            _setp(tint, ("filename", "file"), 'chs("../_tint_file")', expression=True)
-            _setp(tint, "monoop", "lum", required=False)  # color -> luminance
-            _setp(tint, "type", "mask")
-            _setp(tint, ("layer", "layername"), "mask")
-            _setp(tint, "layermode", "replace", required=False)
-            _setp(tint, "doclampmin", 0, required=False)
-            _setp(tint, "doclampmax", 0, required=False)
+            # Show / Hide Tint: the Terrain output becomes the same colored mesh
+            # as the SuperColor bridge's output 1 (polygons + the Tint map as a
+            # texture or as Cd); hidden, it stays the plain HeightField.
+            tint_layers = result
+            for channel, layer in COLOR_CHANNEL_LAYERS:
+                tint_layers = _file_node(subnet, "file_tint_" + layer[-1], tint_layers,
+                                         "mask", layer, file_parm="tint",
+                                         channel=channel)
+            tint_mesh = _colored_mesh(subnet, result, tint_layers, "tint", "tint_")
             result = _switch(
-                subnet, "tint_display_switch", (result, tint),
+                subnet, "tint_display_switch", (result, tint_mesh),
                 'ch("../_imported") && ch("../show_tint") && '
                 'strlen(chs("../_tint_file")) > 0')
         out = subnet.createNode("output", name)
@@ -405,41 +402,64 @@ COLOR_CHANNEL_LAYERS = (("red", "color_r"), ("green", "color_g"), ("blue", "colo
 COLOR_FILE_PARM = ghb.COLOR_LAYERS[0]  # "supercolor": hidden _supercolor_file
 COLOR_IMPORTED_EXPR = 'ch("../_imported") && strlen(chs("../_{}_file")) > 0'.format(
     COLOR_FILE_PARM)
-# Polygons per axis = HeightField voxels per axis * Density; Mesh Resolution caps
-# the longer axis, so a 4K terrain doesn't become 16M polygons.
-MESH_DENSITY_EXPR = ('min(1, ch("../mesh_res") / max(1, max(detail("../res_info", "resx", 0), '
-                     'detail("../res_info", "resy", 0))))')  # HScript max() takes 2 args
 
 
-def _build_color_network(subnet):
-    source = subnet.indirectInputs()[0]
+def _mesh_density_expr(res_info):
+    """Polygons per axis = HeightField voxels per axis * Density; Mesh Resolution
+    caps the longer axis, so a 4K terrain doesn't become 16M polygons."""
+    return ('min(1, ch("../mesh_res") / max(1, max(detail("../{0}", "resx", 0), '
+            'detail("../{0}", "resy", 0))))'.format(res_info))  # HScript max(): 2 args
 
-    # Output 1 - the input HeightField as polygons with the color map as texture.
-    # Convert HeightField writes uv matching the map written by the export, so
-    # the texture lands where Gaea computed it.
-    res_info = subnet.createNode("attribwrangle", "res_info")
+
+def _colored_mesh(subnet, source, layered, file_parm, prefix=""):
+    """HeightField ``source`` as polygons carrying the color map of the hidden
+    ``_<file_parm>_file`` parameter: as a Principled Shader texture (Color Mode
+    Texture) or as Cd sampled from ``layered``'s color_r/g/b layers (Point
+    Color). Convert HeightField writes uv matching the map written by the
+    export, so the texture lands where Gaea computed it. Returns the mesh node;
+    ``prefix`` keeps the node names apart when a network has several meshes."""
+    res_info = subnet.createNode("attribwrangle", prefix + "res_info")
     res_info.setInput(0, source)
     _setp(res_info, "class", "detail")
     _setp(res_info, "snippet",
           'vector r = volumeres(0, "height");\ni@resx = (int)r.x;\ni@resy = (int)r.y;\n')
-    convert = subnet.createNode("convertheightfield", "to_polygons")
+    convert = subnet.createNode("convertheightfield", prefix + "to_polygons")
     convert.setInput(0, source)
     _setp(convert, "conversion", "poly")
-    _setp(convert, "lod", MESH_DENSITY_EXPR, expression=True)
+    _setp(convert, "lod", _mesh_density_expr(res_info.name()), expression=True)
 
     # The material lives inside the asset: a Principled Shader whose base color
     # is the imported map (a per-build file name, see display_path).
-    matnet = subnet.createNode("matnet", "shader")
-    shader = matnet.createNode("principledshader::2.0", "supercolor")
+    matnet = subnet.createNode("matnet", prefix + "shader")
+    shader = matnet.createNode("principledshader::2.0", file_parm)
     _setp(shader, "basecolor_useTexture", 1)
-    _setp(shader, "basecolor_texture", 'chs("../../_{}_file")'.format(COLOR_FILE_PARM),
+    _setp(shader, "basecolor_texture", 'chs("../../_{}_file")'.format(file_parm),
           expression=True)
     _setp(shader, "rough", 1.0, required=False)
     _setp(shader, "metallic", 0.0, required=False)
     _setp(shader, "reflect", 0.0, required=False)
-    assign = subnet.createNode("material", "assign_color")
+    assign = subnet.createNode("material", prefix + "assign_color")
     assign.setInput(0, convert)
-    _setp(assign, "shop_materialpath1", "../shader/supercolor")
+    _setp(assign, "shop_materialpath1", "../{}/{}".format(matnet.name(), file_parm))
+
+    # Color Mode "Point Color": Cd sampled from the layers (no material), for
+    # viewports/pipelines without textures. HeightField volumes are one voxel
+    # thick, so sample at the volumes' own height.
+    bake = subnet.createNode("attribwrangle", prefix + "bake_cd")
+    bake.setInput(0, convert)
+    bake.setInput(1, layered)
+    _setp(bake, "class", "point")
+    _setp(bake, "snippet", "\n".join([
+        "vector p = @P;",
+        "p.y = getbbox_center(1).y;",
+        'v@Cd = set(volumesample(1, "color_r", p), volumesample(1, "color_g", p),',
+        '           volumesample(1, "color_b", p));', ""]))
+    return _switch(subnet, prefix + "color_mode_switch", (assign, bake),
+                   'strcmp(chs("../color_mode"), "cd") == 0')
+
+
+def _build_color_network(subnet):
+    source = subnet.indirectInputs()[0]
 
     # Output 2 - the input HeightField plus color_r / color_g / color_b layers.
     prev = source
@@ -452,22 +472,11 @@ def _build_color_network(subnet):
     out_hf.setInput(0, layered)
     _setp(out_hf, "outputidx", 1)
 
-    # Color Mode "Point Color": Cd sampled from those layers (no material), for
-    # viewports/pipelines without textures. HeightField volumes are one voxel
-    # thick, so sample at the volumes' own height.
-    bake = subnet.createNode("attribwrangle", "bake_cd")
-    bake.setInput(0, convert)
-    bake.setInput(1, prev)
-    _setp(bake, "class", "point")
-    _setp(bake, "snippet", "\n".join([
-        "vector p = @P;",
-        "p.y = getbbox_center(1).y;",
-        'v@Cd = set(volumesample(1, "color_r", p), volumesample(1, "color_g", p),',
-        '           volumesample(1, "color_b", p));', ""]))
-    colored = _switch(subnet, "color_mode_switch", (assign, bake),
-                      'strcmp(chs("../color_mode"), "cd") == 0')
-    shown = _switch(subnet, "mesh_imported_switch", (convert, colored),
-                    COLOR_IMPORTED_EXPR)
+    # Output 1 - the input HeightField as polygons with the color map; before
+    # the import, the bare polygons.
+    colored = _colored_mesh(subnet, source, prev, COLOR_FILE_PARM)
+    shown = _switch(subnet, "mesh_imported_switch",
+                    (subnet.node("to_polygons"), colored), COLOR_IMPORTED_EXPR)
     out_mesh = subnet.createNode("output", "MESH")
     out_mesh.setInput(0, shown)
     _setp(out_mesh, "outputidx", 0)
@@ -690,9 +699,13 @@ def _tint_tab():
     # The display state is the hidden show_tint parameter, set only by the button.
     tab.addParmTemplate(_button(
         "toggle_tint", "Show / Hide Tint", TOGGLE_TINT_CALLBACK,
-        "Show the built Tint map on the Terrain output as its mask (luminance, "
-        "drawn like Show Mask); press again to hide it. Showing re-reads the map, "
-        "so it is always the last import's."))
+        "Show the built Tint map on the Terrain output: the HeightField becomes "
+        "polygons with the map as a texture or as point colors (Color Mode, Mesh "
+        "Resolution below); press again to get the plain HeightField back. Showing "
+        "re-reads the map, so it is always the last import's."))
+    for template in _mesh_display_parms("the Terrain output while the Tint is shown"):
+        template.setConditional(hou.parmCondType.DisableWhen, "{ show_tint == 0 }")
+        tab.addParmTemplate(template)
     tab.addParmTemplate(_button(
         "run_cycle_tint", "Export > Build > Import", CYCLE_CALLBACK,
         "Same as on the Bridge tab: build in Gaea (erosion and tint) and import."))
@@ -700,25 +713,32 @@ def _tint_tab():
     return tab
 
 
+def _mesh_display_parms(what="output 1"):
+    """Color Mode and Mesh Resolution of a colored mesh (see _colored_mesh)."""
+    return [
+        hou.MenuParmTemplate(
+            "color_mode", "Color Mode", ("texture", "cd"),
+            menu_labels=("Texture (material)", "Point Color (Cd)"), default_value=0,
+            help="How {} carries the color map. Texture: a Principled Shader "
+                 "inside the node with the map as base color (sharp at any mesh "
+                 "resolution; needs the viewport's materials/textures on). Point "
+                 "Color: Cd sampled per point from the map (no material; detail "
+                 "limited by Mesh Resolution; also what most exporters and other "
+                 "DCCs pick up).".format(what)),
+        hou.IntParmTemplate(
+            "mesh_res", "Mesh Resolution", 1, default_value=(1024,), min=32, max=8192,
+            min_is_strict=True,
+            help="Polygons along the longer side of {} (the colored mesh). The "
+                 "HeightField's own voxel count is the ceiling: 1024 on a 4K terrain "
+                 "keeps every 4th voxel (~1M quads); 4096 = full detail (~16M quads, "
+                 "slow).".format(what))]
+
+
 def _color_tab():
     """Color profile: the mesh density and the import status."""
     tab = hou.FolderParmTemplate("color_tab", "Color", folder_type=hou.folderType.Tabs)
-    tab.addParmTemplate(hou.MenuParmTemplate(
-        "color_mode", "Color Mode", ("texture", "cd"),
-        menu_labels=("Texture (material)", "Point Color (Cd)"), default_value=0,
-        help="How output 1 carries the color map. Texture: a Principled Shader "
-             "inside the node with the map as base color (sharp at any mesh "
-             "resolution; needs the viewport's materials/textures on). Point "
-             "Color: Cd sampled per point from the color_r/g/b layers (no "
-             "material; detail limited by Mesh Resolution; also what most "
-             "exporters and other DCCs pick up)."))
-    tab.addParmTemplate(hou.IntParmTemplate(
-        "mesh_res", "Mesh Resolution", 1, default_value=(1024,), min=32, max=8192,
-        min_is_strict=True,
-        help="Polygons along the longer side of output 1 (the textured mesh). The "
-             "HeightField's own voxel count is the ceiling: 1024 on a 4K terrain "
-             "keeps every 4th voxel (~1M quads); 4096 = full detail (~16M quads, "
-             "slow). Output 2 keeps the HeightField as is."))
+    for template in _mesh_display_parms("output 1"):
+        tab.addParmTemplate(template)
     tab.addParmTemplate(_button(
         "run_cycle_color", "Export > Build > Import", CYCLE_CALLBACK,
         "Same as on the Bridge tab: export, build the color map in Gaea, import."))

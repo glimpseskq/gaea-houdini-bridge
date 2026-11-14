@@ -77,7 +77,9 @@ Tabs:
   of the Library as a thumbnail, a click picks it.
 - **Tint** (erosion nodes) — *Build Tint* (off by default) builds `output_tint_combine`
   with the project's own Tint settings; off, the tint nodes are left out of the build
-  entirely. **Show / Hide Tint** shows the map as the Terrain's mask (luminance).
+  entirely. **Show / Hide Tint** turns the Terrain output into the same colored mesh as
+  the SuperColor node (*Color Mode*, *Mesh Resolution*); hidden, it is the plain
+  HeightField.
 - **Gaea Layers** (erosion nodes) — Show Mask preview, per-mask Normalize / Range /
   Gamma / Blur, Keep Input Resolution.
 - **Color** (SuperColor) — output 1 is the HeightField as polygons with the color map

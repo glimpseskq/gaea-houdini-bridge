@@ -77,8 +77,9 @@ Export-ноды с именами:
   палитрами библиотеки в виде миниатюр, клик выбирает.
 - **Tint** (эрозионные ноды) — *Build Tint* (по умолчанию выключена) собирает
   `output_tint_combine` с настройками Tint из самого проекта; без галки ноды тинта в
-  сборку не попадают вообще. **Show / Hide Tint** показывает карту как маску Terrain
-  (яркость).
+  сборку не попадают вообще. **Show / Hide Tint** превращает выход Terrain в такой же
+  цветной меш, как у ноды SuperColor (*Color Mode*, *Mesh Resolution*); в скрытом
+  состоянии это обычный HeightField.
 - **Gaea Layers** (эрозионные ноды) — превью Show Mask, для каждой маски Normalize /
   Range / Gamma / Blur, Keep Input Resolution.
 - **Color** (SuperColor) — выход 1: HeightField полигонами с цветовой картой как
