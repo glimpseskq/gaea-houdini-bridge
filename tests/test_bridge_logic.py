@@ -489,6 +489,177 @@ class Erosion1TemplateTests(unittest.TestCase):
         self.assertNotEqual(first, ghb.build_settings(self.cfg))
 
 
+class SuperColorTests(unittest.TestCase):
+    """Gaea SuperColor Bridge: a color map instead of height + masks."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.cfg = ghb.BridgeConfig(bridge_dir=os.path.join(self.tmp, "bridge"),
+                                    gaea_project=os.path.join(self.tmp, "sc.terrain"),
+                                    erosion_kind="SuperColor", use_template=True,
+                                    output_maps=ghb.output_maps_for_kind("SuperColor"))
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _project(self, export="output_supercolor", **values):
+        nodes = {
+            "1": {"$type": "QuadSpinner.Gaea.Nodes.File, Gaea.Nodes", "Id": 1,
+                  "FileName": "D:\\x\\input_height.exr"},
+            "2": {"$type": "QuadSpinner.Gaea.Nodes.File, Gaea.Nodes", "Id": 2,
+                  "FileName": ""},
+            "3": dict({"$type": "QuadSpinner.Gaea.Nodes.SuperColor, Gaea.Nodes", "Id": 3,
+                       "Name": "SuperColor", "Ports": {"$values": [
+                           {"Name": "In", "Record": {"From": 1, "ToPort": "In"}},
+                           {"Name": "Texture", "Record": {"From": 2, "ToPort": "Texture"}}]}},
+                      **values),
+            "4": {"$type": "QuadSpinner.Gaea.Nodes.Export, Gaea.Nodes", "Id": 4,
+                  "Name": export},
+        }
+        with open(self.cfg.gaea_project, "w", encoding="utf-8") as handle:
+            json.dump({"Assets": {"$values": [{"Terrain": {"Nodes": nodes}}]}}, handle)
+
+    def test_spec_is_complete_and_sane(self):
+        names = [spec[0] for spec in ghb.SUPERCOLOR_PARAMS]
+        self.assertEqual(len(names), len(set(names)))
+        self.assertEqual(len(names), 11)  # Randomize (button) and Data are skipped
+        for name, _, _, kind, default, low, high in ghb.SUPERCOLOR_PARAMS:
+            if kind == "enum":
+                self.assertIn(default, low, name)
+            elif kind == "float2":
+                self.assertTrue(all(low <= v <= high for v in default), name)
+            elif kind != "bool":
+                self.assertTrue(low <= default <= high, name)
+        self.assertIs(ghb.erosion_spec("SuperColor"), ghb.SUPERCOLOR_PARAMS)
+
+    def test_outputs_and_project_for_the_kind(self):
+        self.assertEqual(ghb.output_maps_for_kind("SuperColor"),
+                         {"supercolor": "output_supercolor.exr"})
+        self.assertEqual(ghb.output_maps_for_kind("Erosion"), ghb.DEFAULT_OUTPUT_MAPS)
+        self.assertEqual(ghb.primary_output(ghb.DEFAULT_OUTPUT_MAPS), "height")
+        self.assertEqual(self.cfg.primary_output, "supercolor")
+        self.assertEqual(ghb.project_name_for_kind("SuperColor"), "supercolor.terrain")
+        self._project()
+        self.assertEqual(ghb.find_project_for_kind(self.tmp, "SuperColor"),
+                         self.cfg.gaea_project)
+
+    def test_read_fills_defaults_and_float2(self):
+        self._project(Range={"Y": 0.5}, Library="Green", LibraryItem=7, Reverse=True)
+        values = ghb.read_erosion_params(self.cfg.gaea_project, kind="SuperColor")
+        self.assertEqual(values["Range"], (0.0, 0.5))  # X left out by Gaea = 0
+        self.assertEqual(values["Library"], "Green")
+        self.assertEqual(values["LibraryItem"], 7)
+        self.assertIs(values["Reverse"], True)
+        self.assertEqual(values["Texture"], "Peaks")  # Gaea defaults
+        self.assertEqual(values["Amount"], "Low")
+        self.assertEqual(values["Range"], ghb._coerce_kind("float2", {"X": 0, "Y": 0.5}))
+
+    def test_copy_writes_float2_enums_and_paths(self):
+        self._project(LibraryItem=7)
+        # The project needs its own Export, not output_height; the Texture port's
+        # File node is the mask input.
+        self.assertEqual(ghb.check_project_paths(self.cfg, fix_mask_paths=True), [])
+        self.cfg.erosion_params = {"Range": (0.1, 0.9), "Amount": "High", "Reverse": True,
+                                   "LibraryItem": 7, "Library": "Rock"}
+        dst = ghb.template_build_path(self.cfg)
+        changed = ghb.write_template_copy(self.cfg, dst)
+        self.assertEqual(changed, ["Amount", "Range", "Reverse", "input file",
+                                   "mask file", "export paths"])
+        with open(dst, encoding="utf-8") as handle:
+            data = json.load(handle)
+        node = ghb.find_erosion_node(data, kind="SuperColor")
+        self.assertEqual(node["Range"], {"X": 0.1, "Y": 0.9})
+        self.assertEqual(node["Amount"], "High")
+        self.assertIs(node["Reverse"], True)
+        self.assertNotIn("Library", node)  # equal to the default: not written
+        export = ghb._collect_nodes(data, "Export", [])[0]
+        self.assertEqual(export["Location"], "Custom")
+        self.assertTrue(ghb._same_path(export["OutputPath"], self.cfg.output_dir))
+        mask = ghb.mask_file_nodes(data)
+        self.assertEqual(len(mask), 1)
+        self.assertTrue(ghb._same_path(mask[0]["FileName"], self.cfg.mask_input_path))
+
+    def test_wrong_export_name_is_reported(self):
+        self._project(export="output_height")
+        problems = ghb.check_project_paths(self.cfg, fix_mask_paths=True)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("output_supercolor", problems[0])
+
+    def test_node_overrides_select_the_color_outputs(self):
+        node = _FakeNode({"erosion_kind": "SuperColor", "ero_Range": (0.2, 0.8),
+                          "ero_Library": "Blue", "ero_Amount": "Ultra",
+                          "ero_LibraryItem": 3})
+        cfg = ghb.BridgeConfig.load(path="", overrides=ghb.overrides_from_node(node))
+        self.assertEqual(cfg.erosion_kind, "SuperColor")
+        self.assertEqual(cfg.output_maps, {"supercolor": "output_supercolor.exr"})
+        self.assertEqual(cfg.erosion_params,
+                         {"Range": (0.2, 0.8), "Library": "Blue", "Amount": "Ultra",
+                          "LibraryItem": 3})
+        plain = ghb.BridgeConfig.load(path="", overrides=ghb.overrides_from_node(
+            _FakeNode({"erosion_kind": "Erosion"})))
+        self.assertEqual(plain.output_maps, ghb.DEFAULT_OUTPUT_MAPS)
+
+    def test_color_map_found_and_displayed_under_a_build_name(self):
+        os.makedirs(self.cfg.output_dir)
+        source = self.cfg.output_path("supercolor")
+        _write(source, b"rgb")
+        _write(os.path.join(self.cfg.bridge_dir, ghb.TINT_DISPLAY_SUBDIR, "tint_old.exr"))
+        self.assertEqual(ghb.updated_outputs(self.cfg, 0), ["supercolor"])
+        shown = ghb.display_path(self.cfg, source, "supercolor_")
+        self.assertNotIn("\\", shown)
+        self.assertTrue(os.path.basename(shown).startswith("supercolor_"))
+        self.assertTrue(os.path.isfile(shown))
+        # Other prefixes (the tint of an erosion node) are left alone.
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.cfg.bridge_dir, ghb.TINT_DISPLAY_SUBDIR, "tint_old.exr")))
+
+    def _clut(self, name, entries):
+        path = os.path.join(self.tmp, name + ".clut")
+        with open(path, "wb") as handle:
+            handle.write(len(entries).to_bytes(4, "little"))
+            for entry in entries:
+                handle.write(entry)
+        return path
+
+    def test_clut_palettes(self):
+        red = bytes((255, 0, 0)) * ghb.CLUT_STRIP_WIDTH
+        ramp = b"".join(bytes((i // 2, 0, 255 - i // 2)) for i in range(ghb.CLUT_STRIP_WIDTH))
+        path = self._clut("Rock", [red, ramp])
+        self.assertEqual(ghb.clut_count(path), 2)
+        self.assertEqual(ghb.clut_count(os.path.join(self.tmp, "none.clut")), 0)
+        solid = ghb.read_clut(path, 0, samples=4)
+        self.assertEqual(len(solid), 4)
+        self.assertEqual(solid[0], (1.0, 0.0, 0.0))
+        gradient = ghb.read_clut(path, 1, samples=3)
+        self.assertAlmostEqual(gradient[0][2], 1.0)          # starts blue
+        self.assertAlmostEqual(gradient[-1][0], 1.0, places=1)  # ends red-ish
+        self.assertEqual(ghb.read_clut(path, 1, samples=3, reverse=True)[0],
+                         gradient[-1])
+        self.assertIsNone(ghb.read_clut(path, 2))
+        self.assertIsNone(ghb.read_clut(path, -1))
+        self.assertEqual(ghb.clut_path("E:/Gaea/Gaea.exe", "Sand").replace("\\", "/"),
+                         "E:/Gaea/Resources/Color/Sand.clut")
+        self.assertEqual(ghb.clut_path("", "Sand"), "")
+        # A truncated file never claims palettes it doesn't hold.
+        short = self._clut("Short", [red[:100]])
+        self.assertEqual(ghb.clut_count(short), 0)
+
+    def test_clut_strips_for_picker(self):
+        red = bytes((255, 0, 0)) * ghb.CLUT_STRIP_WIDTH
+        ramp = b"".join(bytes((i // 2, 0, 255 - i // 2)) for i in range(ghb.CLUT_STRIP_WIDTH))
+        path = self._clut("Rock", [red, ramp])
+        strips = ghb.read_clut_strips(path)
+        self.assertEqual([len(s) for s in strips], [ghb.CLUT_ENTRY_SIZE] * 2)
+        self.assertEqual(strips[0], red)
+        self.assertEqual(strips[1][:3], bytes((0, 0, 255)))
+        reversed_strips = ghb.read_clut_strips(path, reverse=True)
+        self.assertEqual(reversed_strips[1][:3], ramp[-3:])
+        self.assertEqual(reversed_strips[1][-3:], ramp[:3])
+        self.assertEqual(ghb.read_clut_strips(os.path.join(self.tmp, "none.clut")), [])
+        self.assertEqual(ghb.read_clut_strips(""), [])
+
+
 class SharedPathsTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -791,8 +962,8 @@ class TintTests(unittest.TestCase):
         self.assertFalse(os.path.exists(first))  # old map cleaned up
         with open(second, "rb") as handle:
             self.assertEqual(handle.read(), b"second build")
-        self.assertEqual(os.path.dirname(second), os.path.join(
-            self.cfg.bridge_dir, ghb.TINT_DISPLAY_SUBDIR))
+        self.assertEqual(os.path.normpath(os.path.dirname(second)), os.path.normpath(
+            os.path.join(self.cfg.bridge_dir, ghb.TINT_DISPLAY_SUBDIR)))
 
     def test_fresh_display_path_is_always_new(self):
         source = os.path.join(self.cfg.output_dir, "output_tint_combine.exr")

@@ -44,9 +44,16 @@ import houdini_gaea_bridge as ghb
 # names say Erosion2, like in Gaea.
 ASSETS = {
     "Erosion2": {"type_name": "gaea_erosion_bridge", "label": "Gaea Erosion2 Bridge",
-                 "node_name": "gaea_erosion2_bridge"},
+                 "node_name": "gaea_erosion2_bridge", "profile": "erosion"},
     "Erosion": {"type_name": "gaea_erosion1_bridge", "label": "Gaea Erosion Bridge",
-                "node_name": None},  # Houdini already names them gaea_erosion1_bridge1
+                "node_name": None,  # Houdini already names them gaea_erosion1_bridge1
+                "profile": "erosion"},
+    # Color profile: the project writes one RGB map (output_supercolor), shown as
+    # a texture on a polygon mesh and as color_r/g/b layers; the height is the
+    # input's.
+    "SuperColor": {"type_name": "gaea_supercolor_bridge",
+                   "label": "Gaea SuperColor Bridge", "node_name": None,
+                   "profile": "color"},
 }
 ASSET_TYPE_NAME = ASSETS["Erosion2"]["type_name"]
 ASSET_LABEL = ASSETS["Erosion2"]["label"]
@@ -143,6 +150,21 @@ ghb.on_template_toggled(kwargs['node'])
 EROSION_CHANGED_CALLBACK = r"""
 import houdini_gaea_bridge as ghb
 ghb.on_erosion_parm_changed(kwargs['node'])
+""".strip()
+
+SUPERCOLOR_CHANGED_CALLBACK = r"""
+import houdini_gaea_bridge as ghb
+ghb.on_supercolor_parm_changed(kwargs['node'])
+""".strip()
+
+PALETTE_PREVIEW_CALLBACK = r"""
+import houdini_gaea_bridge as ghb
+ghb.update_palette_preview(kwargs['node'])
+""".strip()
+
+CHOOSE_PALETTE_CALLBACK = r"""
+import houdini_gaea_bridge as ghb
+ghb.choose_palette(kwargs['node'])
 """.strip()
 
 READ_TEMPLATE_CALLBACK = r"""
@@ -260,13 +282,18 @@ def _setp(node, candidates, value, expression=False, required=True):
     return None
 
 
-def _file_node(parent, name, source, layer_type, layer):
+def _file_node(parent, name, source, layer_type, layer, file_parm=None, channel=None):
+    """HeightField File reading the hidden ``_<file_parm>_file`` parameter
+    (default: the layer's) into ``layer``; ``channel``: which image channel a
+    mask takes (heightfield_file "monoop": red / green / blue / lum)."""
     node = parent.createNode("heightfield_file", name)
     if source is not None:
         node.setInput(0, source)
-    _setp(node, ("filename", "file"), 'chs("../_{}_file")'.format(layer),
+    _setp(node, ("filename", "file"), 'chs("../_{}_file")'.format(file_parm or layer),
           expression=True)
     _setp(node, "type", layer_type)
+    if channel:
+        _setp(node, "monoop", channel, required=False)
     # Mask layers must land in a layer named after them.
     _setp(node, ("layer", "layername"), layer, required=layer_type == "mask")
     _setp(node, "layermode", "replace", required=False)
@@ -348,20 +375,17 @@ def _build_network(subnet):
         result = _switch(subnet, name.lower() + "_grid_switch",
                          (result, on_input_grid), 'ch("../keep_input_res")')
         if index == 0:
-            # Show / Hide Tint: the Tint map, converted to luminance, goes into
-            # the Terrain output's "mask" layer and is drawn like Show Mask (a
-            # layer change the viewport always follows). No extra layer.
-            tint = subnet.createNode("heightfield_file", "tint_to_mask")
-            tint.setInput(0, result)
-            _setp(tint, ("filename", "file"), 'chs("../_tint_file")', expression=True)
-            _setp(tint, "monoop", "lum", required=False)  # color -> luminance
-            _setp(tint, "type", "mask")
-            _setp(tint, ("layer", "layername"), "mask")
-            _setp(tint, "layermode", "replace", required=False)
-            _setp(tint, "doclampmin", 0, required=False)
-            _setp(tint, "doclampmax", 0, required=False)
+            # Show / Hide Tint: the Terrain output becomes the same colored mesh
+            # as the SuperColor bridge's output 1 (polygons + the Tint map as a
+            # texture or as Cd); hidden, it stays the plain HeightField.
+            tint_layers = result
+            for channel, layer in COLOR_CHANNEL_LAYERS:
+                tint_layers = _file_node(subnet, "file_tint_" + layer[-1], tint_layers,
+                                         "mask", layer, file_parm="tint",
+                                         channel=channel)
+            tint_mesh = _colored_mesh(subnet, result, tint_layers, "tint", "tint_")
             result = _switch(
-                subnet, "tint_display_switch", (result, tint),
+                subnet, "tint_display_switch", (result, tint_mesh),
                 'ch("../_imported") && ch("../show_tint") && '
                 'strlen(chs("../_tint_file")) > 0')
         out = subnet.createNode("output", name)
@@ -370,6 +394,94 @@ def _build_network(subnet):
         if index == 0:
             out.setDisplayFlag(True)
             out.setRenderFlag(True)
+    subnet.layoutChildren()
+
+
+# Color profile: the imported map's channels as HeightField layers (output 2).
+COLOR_CHANNEL_LAYERS = (("red", "color_r"), ("green", "color_g"), ("blue", "color_b"))
+COLOR_FILE_PARM = ghb.COLOR_LAYERS[0]  # "supercolor": hidden _supercolor_file
+COLOR_IMPORTED_EXPR = 'ch("../_imported") && strlen(chs("../_{}_file")) > 0'.format(
+    COLOR_FILE_PARM)
+
+
+def _mesh_density_expr(res_info):
+    """Polygons per axis = HeightField voxels per axis * Density; Mesh Resolution
+    caps the longer axis, so a 4K terrain doesn't become 16M polygons."""
+    return ('min(1, ch("../mesh_res") / max(1, max(detail("../{0}", "resx", 0), '
+            'detail("../{0}", "resy", 0))))'.format(res_info))  # HScript max(): 2 args
+
+
+def _colored_mesh(subnet, source, layered, file_parm, prefix=""):
+    """HeightField ``source`` as polygons carrying the color map of the hidden
+    ``_<file_parm>_file`` parameter: as a Principled Shader texture (Color Mode
+    Texture) or as Cd sampled from ``layered``'s color_r/g/b layers (Point
+    Color). Convert HeightField writes uv matching the map written by the
+    export, so the texture lands where Gaea computed it. Returns the mesh node;
+    ``prefix`` keeps the node names apart when a network has several meshes."""
+    res_info = subnet.createNode("attribwrangle", prefix + "res_info")
+    res_info.setInput(0, source)
+    _setp(res_info, "class", "detail")
+    _setp(res_info, "snippet",
+          'vector r = volumeres(0, "height");\ni@resx = (int)r.x;\ni@resy = (int)r.y;\n')
+    convert = subnet.createNode("convertheightfield", prefix + "to_polygons")
+    convert.setInput(0, source)
+    _setp(convert, "conversion", "poly")
+    _setp(convert, "lod", _mesh_density_expr(res_info.name()), expression=True)
+
+    # The material lives inside the asset: a Principled Shader whose base color
+    # is the imported map (a per-build file name, see display_path).
+    matnet = subnet.createNode("matnet", prefix + "shader")
+    shader = matnet.createNode("principledshader::2.0", file_parm)
+    _setp(shader, "basecolor_useTexture", 1)
+    _setp(shader, "basecolor_texture", 'chs("../../_{}_file")'.format(file_parm),
+          expression=True)
+    _setp(shader, "rough", 1.0, required=False)
+    _setp(shader, "metallic", 0.0, required=False)
+    _setp(shader, "reflect", 0.0, required=False)
+    assign = subnet.createNode("material", prefix + "assign_color")
+    assign.setInput(0, convert)
+    _setp(assign, "shop_materialpath1", "../{}/{}".format(matnet.name(), file_parm))
+
+    # Color Mode "Point Color": Cd sampled from the layers (no material), for
+    # viewports/pipelines without textures. HeightField volumes are one voxel
+    # thick, so sample at the volumes' own height.
+    bake = subnet.createNode("attribwrangle", prefix + "bake_cd")
+    bake.setInput(0, convert)
+    bake.setInput(1, layered)
+    _setp(bake, "class", "point")
+    _setp(bake, "snippet", "\n".join([
+        "vector p = @P;",
+        "p.y = getbbox_center(1).y;",
+        'v@Cd = set(volumesample(1, "color_r", p), volumesample(1, "color_g", p),',
+        '           volumesample(1, "color_b", p));', ""]))
+    return _switch(subnet, prefix + "color_mode_switch", (assign, bake),
+                   'strcmp(chs("../color_mode"), "cd") == 0')
+
+
+def _build_color_network(subnet):
+    source = subnet.indirectInputs()[0]
+
+    # Output 2 - the input HeightField plus color_r / color_g / color_b layers.
+    prev = source
+    for channel, layer in COLOR_CHANNEL_LAYERS:
+        prev = _file_node(subnet, "file_" + layer, prev, "mask", layer,
+                          file_parm=COLOR_FILE_PARM, channel=channel)
+    layered = _switch(subnet, "layers_imported_switch", (source, prev),
+                      COLOR_IMPORTED_EXPR)
+    out_hf = subnet.createNode("output", "HEIGHTFIELD")
+    out_hf.setInput(0, layered)
+    _setp(out_hf, "outputidx", 1)
+
+    # Output 1 - the input HeightField as polygons with the color map; before
+    # the import, the bare polygons.
+    colored = _colored_mesh(subnet, source, prev, COLOR_FILE_PARM)
+    shown = _switch(subnet, "mesh_imported_switch",
+                    (subnet.node("to_polygons"), colored), COLOR_IMPORTED_EXPR)
+    out_mesh = subnet.createNode("output", "MESH")
+    out_mesh.setInput(0, shown)
+    _setp(out_mesh, "outputidx", 0)
+    out_mesh.setDisplayFlag(True)
+    out_mesh.setRenderFlag(True)
     subnet.layoutChildren()
 
 
@@ -427,9 +539,16 @@ def _enum_label(token):
 def _erosion_parm(node_kind, name, label, kind, default, low, high):
     parm_name = ghb.EROSION_PARM_PREFIX + name
     help_text = "Gaea {} '{}' (default {}).".format(node_kind, name, default)
-    # Every Erosion value triggers Auto Build on Change (if it's on).
-    callback = dict(script_callback=EROSION_CHANGED_CALLBACK,
+    # Every value triggers Auto Build on Change (if it's on); SuperColor's also
+    # refresh the palette preview.
+    callback = dict(script_callback=(SUPERCOLOR_CHANGED_CALLBACK if node_kind == "SuperColor"
+                                     else EROSION_CHANGED_CALLBACK),
                     script_callback_language=hou.scriptLanguage.Python)
+    if kind == "float2":
+        return hou.FloatParmTemplate(
+            parm_name, label, 2, default_value=tuple(float(v) for v in default),
+            min=low, max=high, min_is_strict=True, max_is_strict=True,
+            naming_scheme=hou.parmNamingScheme.MinMax, help=help_text, **callback)
     if kind == "enum":
         return hou.MenuParmTemplate(
             parm_name, label, tuple(low), menu_labels=tuple(_enum_label(v) for v in low),
@@ -472,9 +591,11 @@ def _status_parm(name):
 
 
 def _erosion_tab(node_kind):
-    """Parameters of the project's erosion node (``node_kind``: "Erosion2" or
-    "Erosion"), shown in template mode."""
-    tab = hou.FolderParmTemplate("erosion_tab", "Erosion",
+    """Parameters of the project's Gaea node (``node_kind``: "Erosion2",
+    "Erosion" or "SuperColor"), shown in template mode. The parameter names stay
+    the erosion ones (use_template, ero_*) for every kind."""
+    is_erosion = ASSETS[node_kind]["profile"] == "erosion"
+    tab = hou.FolderParmTemplate("erosion_tab", "Erosion" if is_erosion else node_kind,
                                  folder_type=hou.folderType.Tabs)
     # Same action and status as on the Bridge tab, so the loop "tweak -> rebuild"
     # never leaves this tab.
@@ -491,8 +612,8 @@ def _erosion_tab(node_kind):
                                 "Stop the running build and unlock the node."))
     tab.addParmTemplate(_status_parm("_status_erosion"))
     tab.addParmTemplate(hou.ToggleParmTemplate(
-        "use_template", "Use Erosion Template", default_value=False,
-        script_callback=TEMPLATE_CALLBACK,
+        "use_template", "Use {} Template".format("Erosion" if is_erosion else node_kind),
+        default_value=False, script_callback=TEMPLATE_CALLBACK,
         script_callback_language=hou.scriptLanguage.Python,
         help="The Gaea Project is a template whose {0} node feeds the Export "
              "nodes. Build in Gaea then builds a copy of it with the values below; "
@@ -501,7 +622,8 @@ def _erosion_tab(node_kind):
     hidden = "{ use_template == 0 }"
 
     node_name = hou.StringParmTemplate(
-        "erosion_node", "Erosion Node", 1, default_value=("",),
+        "erosion_node", "{} Node".format("Erosion" if is_erosion else node_kind), 1,
+        default_value=("",),
         help="Name of the {0} node to drive. Empty = the only {0} in the "
              "project.".format(node_kind))
     node_name.setConditional(hou.parmCondType.HideWhen, hidden)
@@ -535,6 +657,28 @@ def _erosion_tab(node_kind):
             template.setConditional(hou.parmCondType.DisableWhen,
                                     "{ ero_AreaEffect == None }")
         folder.addParmTemplate(template)
+        if node_kind == "SuperColor" and name == "LibraryItem":
+            folder.addParmTemplate(_button(
+                "choose_palette", "Choose Palette...", CHOOSE_PALETTE_CALLBACK,
+                "Open a window with every palette of the Library as a thumbnail; "
+                "a click sets Library + Palette here (Auto Build on Change applies)."))
+            # The palette behind Library + Palette, read from Gaea's .clut files.
+            preview = hou.RampParmTemplate(
+                ghb.PALETTE_PREVIEW_PARM, "Palette Preview", hou.rampParmType.Color,
+                default_value=2, color_type=hou.colorType.RGB,
+                help="The chosen Gaea palette (Library + Palette, Reverse), read "
+                     "from Gaea's Resources/Color/<Library>.clut next to Gaea Exe. "
+                     "Preview only: edits here change nothing; Gaea applies Range "
+                     "and Bias on top.")
+            preview.setConditional(hou.parmCondType.DisableWhen, "{ 1 == 1 }")
+            folder.addParmTemplate(preview)
+            info = hou.StringParmTemplate(ghb.PALETTE_INFO_PARM, "Palette Info", 1,
+                                          default_value=("",))
+            info.setConditional(hou.parmCondType.DisableWhen, "{ 1 == 1 }")
+            folder.addParmTemplate(info)
+            folder.addParmTemplate(_button(
+                "refresh_palette", "Refresh Palette Preview", PALETTE_PREVIEW_CALLBACK,
+                "Re-read the palette (after setting Gaea Exe)."))
     for folder in folders.values():
         tab.addParmTemplate(folder)
     return tab
@@ -555,9 +699,13 @@ def _tint_tab():
     # The display state is the hidden show_tint parameter, set only by the button.
     tab.addParmTemplate(_button(
         "toggle_tint", "Show / Hide Tint", TOGGLE_TINT_CALLBACK,
-        "Show the built Tint map on the Terrain output as its mask (luminance, "
-        "drawn like Show Mask); press again to hide it. Showing re-reads the map, "
-        "so it is always the last import's."))
+        "Show the built Tint map on the Terrain output: the HeightField becomes "
+        "polygons with the map as a texture or as point colors (Color Mode, Mesh "
+        "Resolution below); press again to get the plain HeightField back. Showing "
+        "re-reads the map, so it is always the last import's."))
+    for template in _mesh_display_parms("the Terrain output while the Tint is shown"):
+        template.setConditional(hou.parmCondType.DisableWhen, "{ show_tint == 0 }")
+        tab.addParmTemplate(template)
     tab.addParmTemplate(_button(
         "run_cycle_tint", "Export > Build > Import", CYCLE_CALLBACK,
         "Same as on the Bridge tab: build in Gaea (erosion and tint) and import."))
@@ -565,7 +713,41 @@ def _tint_tab():
     return tab
 
 
+def _mesh_display_parms(what="output 1"):
+    """Color Mode and Mesh Resolution of a colored mesh (see _colored_mesh)."""
+    return [
+        hou.MenuParmTemplate(
+            "color_mode", "Color Mode", ("texture", "cd"),
+            menu_labels=("Texture (material)", "Point Color (Cd)"), default_value=0,
+            help="How {} carries the color map. Texture: a Principled Shader "
+                 "inside the node with the map as base color (sharp at any mesh "
+                 "resolution; needs the viewport's materials/textures on). Point "
+                 "Color: Cd sampled per point from the map (no material; detail "
+                 "limited by Mesh Resolution; also what most exporters and other "
+                 "DCCs pick up).".format(what)),
+        hou.IntParmTemplate(
+            "mesh_res", "Mesh Resolution", 1, default_value=(1024,), min=32, max=8192,
+            min_is_strict=True,
+            help="Polygons along the longer side of {} (the colored mesh). The "
+                 "HeightField's own voxel count is the ceiling: 1024 on a 4K terrain "
+                 "keeps every 4th voxel (~1M quads); 4096 = full detail (~16M quads, "
+                 "slow).".format(what))]
+
+
+def _color_tab():
+    """Color profile: the mesh density and the import status."""
+    tab = hou.FolderParmTemplate("color_tab", "Color", folder_type=hou.folderType.Tabs)
+    for template in _mesh_display_parms("output 1"):
+        tab.addParmTemplate(template)
+    tab.addParmTemplate(_button(
+        "run_cycle_color", "Export > Build > Import", CYCLE_CALLBACK,
+        "Same as on the Bridge tab: export, build the color map in Gaea, import."))
+    tab.addParmTemplate(_status_parm("_status_color"))
+    return tab
+
+
 def _build_parm_template_group(node_kind="Erosion2"):
+    profile = ASSETS[node_kind]["profile"]
     g = hou.ParmTemplateGroup()
 
     # --- Bridge tab ---------------------------------------------------- #
@@ -634,9 +816,51 @@ def _build_parm_template_group(node_kind="Erosion2"):
     g.append(bridge)
 
     g.append(_erosion_tab(node_kind))
-    g.append(_tint_tab())
+    if profile == "color":
+        g.append(_color_tab())
+    else:
+        g.append(_tint_tab())
+        g.append(_layers_tab())
 
-    # --- Layers tab ---------------------------------------------------- #
+    g.append(_paths_tab(node_kind))
+
+    # --- Hidden state written by Import ------------------------------- #
+    g.append(_hidden(hou.ToggleParmTemplate("_imported", "Imported",
+                                            default_value=False)))
+    g.append(_hidden(hou.StringParmTemplate("_import_stamp", "Import stamp", 1,
+                                            default_value=("",))))
+    g.append(_hidden(hou.ToggleParmTemplate("_ero_loaded", "Template values loaded",
+                                            default_value=False)))
+    # Which Gaea node this HDA drives (fixed per asset).
+    g.append(_hidden(hou.StringParmTemplate("erosion_kind", "Gaea node kind", 1,
+                                            default_value=(node_kind,))))
+    g.append(_hidden(hou.FloatParmTemplate("_houdini_width", "_houdini_width", 1,
+                                           default_value=(0.0,))))
+    g.append(_hidden(hou.ToggleParmTemplate("_locked", "Locked during auto build",
+                                            default_value=False)))
+    if profile == "color":
+        for layer in ghb.COLOR_LAYERS:
+            g.append(_hidden(hou.StringParmTemplate(
+                "_{}_file".format(layer), layer + " file", 1, default_value=("",))))
+    else:
+        g.append(_hidden(hou.StringParmTemplate("_tint_file", "Tint map", 1,
+                                                default_value=("",))))
+        # Tint display state, set only by Show / Hide Tint.
+        g.append(_hidden(hou.ToggleParmTemplate("show_tint", "Tint shown",
+                                                default_value=False)))
+        for layer in ("height",) + MASK_LAYERS:
+            g.append(_hidden(hou.StringParmTemplate(
+                "_{}_file".format(layer), layer + " file", 1, default_value=("",))))
+        for layer in MASK_LAYERS:
+            g.append(_hidden(hou.FloatParmTemplate(
+                "_{}_peak".format(layer), layer + " peak", 1, default_value=(0.0,))))
+        for name in ("_enc_span", "_enc_offset"):
+            g.append(_hidden(hou.FloatParmTemplate(name, name, 1, default_value=(0.0,))))
+
+    return hou.ParmTemplateGroup([_with_lock(t) for t in g.entries()])
+
+
+def _layers_tab():
     layers = hou.FolderParmTemplate("layers_tab", "Gaea Layers",
                                     folder_type=hou.folderType.Tabs)
     layers.addParmTemplate(hou.MenuParmTemplate(
@@ -663,9 +887,10 @@ def _build_parm_template_group(node_kind="Erosion2"):
     layers.addParmTemplate(_mask_folder(
         "sediment", "Sediment", "Where eroded material was deposited "
         "(Erosion2 Deposits)."))
-    g.append(layers)
+    return layers
 
-    # --- Paths tab ----------------------------------------------------- #
+
+def _paths_tab(node_kind):
     paths = hou.FolderParmTemplate("paths_tab", "Paths",
                                    folder_type=hou.folderType.Tabs)
     paths.addParmTemplate(hou.StringParmTemplate(
@@ -708,35 +933,7 @@ def _build_parm_template_group(node_kind="Erosion2"):
         "gaea_height", "Gaea Height (m)", 1, default_value=(0.0,), min=0.0,
         max=10000.0,
         help="Gaea Terrain Definition > Height. 0 = read from the .terrain project."))
-    g.append(paths)
-
-    # --- Hidden state written by Import ------------------------------- #
-    g.append(_hidden(hou.ToggleParmTemplate("_imported", "Imported",
-                                            default_value=False)))
-    g.append(_hidden(hou.StringParmTemplate("_import_stamp", "Import stamp", 1,
-                                            default_value=("",))))
-    g.append(_hidden(hou.StringParmTemplate("_tint_file", "Tint map", 1,
-                                            default_value=("",))))
-    # Tint display state, set only by Show / Hide Tint.
-    g.append(_hidden(hou.ToggleParmTemplate("show_tint", "Tint shown",
-                                            default_value=False)))
-    g.append(_hidden(hou.ToggleParmTemplate("_ero_loaded", "Erosion values loaded",
-                                            default_value=False)))
-    # Which Gaea erosion node this HDA drives (fixed per asset).
-    g.append(_hidden(hou.StringParmTemplate("erosion_kind", "Erosion node kind", 1,
-                                            default_value=(node_kind,))))
-    for layer in ("height",) + MASK_LAYERS:
-        g.append(_hidden(hou.StringParmTemplate(
-            "_{}_file".format(layer), layer + " file", 1, default_value=("",))))
-    for layer in MASK_LAYERS:
-        g.append(_hidden(hou.FloatParmTemplate(
-            "_{}_peak".format(layer), layer + " peak", 1, default_value=(0.0,))))
-    for name in ("_enc_span", "_enc_offset", "_houdini_width"):
-        g.append(_hidden(hou.FloatParmTemplate(name, name, 1, default_value=(0.0,))))
-    g.append(_hidden(hou.ToggleParmTemplate("_locked", "Locked during auto build",
-                                            default_value=False)))
-
-    return hou.ParmTemplateGroup([_with_lock(t) for t in g.entries()])
+    return paths
 
 
 def _set_io_labels(definition, inputs, outputs):
@@ -760,6 +957,7 @@ def build(install_dir=None, node_kind="Erosion2"):
     ("Erosion2" or "Erosion"). Returns the path to the .hda file."""
     asset_info = ASSETS[node_kind]
     type_name, label = asset_info["type_name"], asset_info["label"]
+    color = asset_info["profile"] == "color"
     del OPTIONAL_PARMS_MISSING[:]
     obj = hou.node("/obj")
     container = obj.createNode("geo", "GHBRIDGE_TEMP_BUILD")
@@ -768,7 +966,10 @@ def build(install_dir=None, node_kind="Erosion2"):
         # Give the subnet the interface first so the "../parm" expressions inside
         # resolve while the network is built.
         subnet.setParmTemplateGroup(_build_parm_template_group(node_kind))
-        _build_network(subnet)
+        if color:
+            _build_color_network(subnet)
+        else:
+            _build_network(subnet)
 
         if install_dir is None:
             install_dir = os.path.join(
@@ -787,9 +988,14 @@ def build(install_dir=None, node_kind="Erosion2"):
 
         definition = asset.type().definition()
         definition.setParmTemplateGroup(_build_parm_template_group(node_kind))
-        definition.setMaxNumOutputs(1 + len(MASK_LAYERS))
-        _set_io_labels(definition, inputs=("HeightField", "Mask (optional)"),
-                       outputs=("Terrain",) + tuple(l.capitalize() for l in MASK_LAYERS))
+        if color:
+            inputs = ("HeightField", "Texture mask (optional)")
+            outputs = ("Colored Mesh", "HeightField + color_r/g/b")
+        else:
+            inputs = ("HeightField", "Mask (optional)")
+            outputs = ("Terrain",) + tuple(l.capitalize() for l in MASK_LAYERS)
+        definition.setMaxNumOutputs(len(outputs))
+        _set_io_labels(definition, inputs=inputs, outputs=outputs)
         scripts = [("OnLoaded", ON_LOADED_SCRIPT), ("OnDeleted", ON_DELETED_SCRIPT)]
         if asset_info["node_name"]:
             scripts.insert(0, ("OnCreated", ON_CREATED_SCRIPT))
@@ -813,7 +1019,8 @@ def build(install_dir=None, node_kind="Erosion2"):
 
 
 def build_all(install_dir=None):
-    """Install both bridges: Gaea Erosion2 Bridge and Gaea Erosion Bridge."""
+    """Install every bridge: Gaea Erosion2 Bridge, Gaea Erosion Bridge and Gaea
+    SuperColor Bridge."""
     return [build(install_dir, node_kind) for node_kind in ASSETS]
 
 

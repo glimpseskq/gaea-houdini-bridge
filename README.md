@@ -2,20 +2,23 @@
 
 **English** | [Русский](README.ru.md)
 
-A Houdini node that sends a HeightField to **Gaea 2**, builds the Gaea project with
-`Gaea.Swarm.exe` (Gaea never opens) and brings the eroded terrain, its masks and tint
-maps back into Houdini.
+Houdini nodes that send a HeightField to **Gaea 2**, build the Gaea project with
+`Gaea.Swarm.exe` (Gaea never opens) and bring the result back into Houdini: the eroded
+terrain with its masks (Erosion2 / Erosion) or a color map (SuperColor).
 
 ```
-HeightField ─▶ input_height.exr ─▶ Gaea: File ─▶ Erosion2 ─▶ Export nodes
-Terrain + masks ◀── output/output_*.exr ◀─────────────────────────┘
+HeightField ─▶ input_height.exr ─▶ Gaea: File ─▶ Erosion2 / SuperColor ─▶ Export nodes
+Terrain + masks / color ◀── output/output_*.exr ◀───────────────────────────┘
 ```
 
 ## Features
 
 - **One button**: Export > Build > Import, in the background.
-- **Four outputs**: Terrain, Flow, Wear, Sediment (masks ready for HeightField nodes).
-- **Erosion2 / Erosion parameters in Houdini**: change them and rebuild; the Gaea
+- **Erosion nodes, four outputs**: Terrain, Flow, Wear, Sediment (masks ready for
+  HeightField nodes).
+- **SuperColor node**: the color map as a textured mesh (or point colors) and as
+  `color_r/g/b` HeightField layers; the chosen Gaea palette is previewed in Houdini.
+- **The Gaea node's parameters in Houdini**: change them and rebuild; the Gaea
   project itself is never modified (a copy is built).
 - **Mask input**: the second input limits where Gaea erodes (any mask or geometry).
 - **1:1 scale**, export resolution Full–1/4, build resolution up to 16K, build cache.
@@ -32,20 +35,21 @@ Terrain + masks ◀── output/output_*.exr ◀──────────�
    ```python
    exec(open(r"C:/path/to/BridgeHGH/build_gaea_bridge_hda.py").read())
    ```
-   Two nodes appear in the SOP Tab menu: **Gaea Erosion2 Bridge** (for a project
-   with Gaea's Erosion2) and **Gaea Erosion Bridge** (for the older Erosion node).
-   They work the same; each exposes its own node's parameters.
+   Three nodes appear in the SOP Tab menu: **Gaea Erosion2 Bridge**, **Gaea Erosion
+   Bridge** (the older Erosion node) and **Gaea SuperColor Bridge**. They work the
+   same; each exposes its own Gaea node's parameters.
 
 ## Gaea project (once)
 
-`File` (any path; the bridge sets it) → **Erosion2** (or **Erosion**) → Export nodes
-named:
+`File` (any path; the bridge sets it) → **Erosion2** / **Erosion** / **SuperColor** →
+Export nodes named:
 
-| Erosion2 output | Export node |
-|-----------------|-------------|
-| Out / Flow / Wear / Deposits | `output_height` / `output_flow` / `output_wear` / `output_sediment` |
+| Gaea output | Export node |
+|-------------|-------------|
+| Erosion2 Out / Flow / Wear / Deposits | `output_height` / `output_flow` / `output_wear` / `output_sediment` |
 | color map (Tint nodes → Combine), optional | `output_tint_combine` |
-| Mask port ← second `File` node | loads `<Bridge Dir>/input_mask.exr` |
+| SuperColor Out | `output_supercolor` |
+| Mask / Texture port ← second `File` node | loads `<Bridge Dir>/input_mask.exr` |
 
 Export format EXR. The bridge builds a copy of the project and sets every path in it
 (input File, mask File, Export locations), so the saved project is never modified and
@@ -56,8 +60,9 @@ never has to point at the bridge folder. Each bridge node works in its own folde
 
 1. Connect a HeightField (and optionally a mask) to the node.
 2. **Paths** tab, once: **Gaea Exe** (shared by every bridge node). Each node finds its
-   project by itself (`erosion2.terrain` / `erosion.terrain`, else any project with that
-   node) in the scene folder or next to `houdini_gaea_bridge.py`, subfolders included;
+   project by itself (`erosion2.terrain` / `erosion.terrain` / `supercolor.terrain`, else
+   any project with that node) in the scene folder or next to `houdini_gaea_bridge.py`,
+   subfolders included;
    set **Gaea Project** only to pick a specific file. **Check Paths** shows what is in
    use.
 3. Press **Export > Build > Import**.
@@ -65,14 +70,22 @@ never has to point at the bridge folder. Each bridge node works in its own folde
 Tabs:
 
 - **Bridge** — export resolution, build options, step-by-step buttons, Auto Import.
-- **Erosion** — *Use Erosion Template* exposes all parameters of the project's erosion
-  node (Erosion2 or Erosion, depending on the bridge node); *Auto Build on
-  Change* rebuilds after every edit (the node is locked until the import).
-- **Tint** — *Build Tint* (off by default) builds `output_tint_combine` with the
-  project's own Tint settings; off, the tint nodes are left out of the build entirely. **Show / Hide Tint**
-  shows the map as the Terrain's mask (luminance).
-- **Gaea Layers** — Show Mask preview, per-mask Normalize / Range / Gamma / Blur,
-  Keep Input Resolution.
+- **Erosion** / **SuperColor** — *Use ... Template* exposes all parameters of the
+  project's Gaea node; *Auto Build on Change* rebuilds after every edit (the node is
+  locked until the import). SuperColor shows the chosen palette (read from Gaea's
+  `Resources/Color/*.clut`); **Choose Palette...** opens a window with every palette
+  of the Library as a thumbnail, a click picks it.
+- **Tint** (erosion nodes) — *Build Tint* (off by default) builds `output_tint_combine`
+  with the project's own Tint settings; off, the tint nodes are left out of the build
+  entirely. **Show / Hide Tint** turns the Terrain output into the same colored mesh as
+  the SuperColor node (*Color Mode*, *Mesh Resolution*); hidden, it is the plain
+  HeightField.
+- **Gaea Layers** (erosion nodes) — Show Mask preview, per-mask Normalize / Range /
+  Gamma / Blur, Keep Input Resolution.
+- **Color** (SuperColor) — output 1 is the HeightField as polygons with the color map
+  as a texture (*Color Mode: Texture*, a Principled Shader inside the node) or as
+  point colors (*Point Color*); *Mesh Resolution* caps the polygons per axis. Output 2
+  is the HeightField with `color_r` / `color_g` / `color_b` layers.
 
 ## Tests
 
