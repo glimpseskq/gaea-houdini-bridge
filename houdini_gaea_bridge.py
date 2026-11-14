@@ -119,17 +119,15 @@ class BridgeConfig:
     erosion_node: str = ""  # erosion node name; "" = the only one in the project
     erosion_params: dict = field(default_factory=dict)
     # Which Gaea erosion node the project uses: "Erosion2" or the older "Erosion"
-    # (one bridge HDA per kind; each has its own parameter set).
+    # (one bridge HDA per kind; each has its own parameter set). With gaea_project
+    # empty, the project is found by kind in the scene and module folders.
     erosion_kind: str = "Erosion2"
-    # Folder (with subfolders) searched for the project when gaea_project is
-    # empty: <kind>.terrain first, else any project with that erosion node.
-    gaea_projects_dir: str = ""
     # Tint (Tint tab): the Export node writing the project's color map, only shown
     # on the terrain (Show / Hide Tint), never output as a layer. The Tint settings
     # are the project's own. With build_tint off, the build copy leaves out that
     # Export and the nodes feeding only it, so Gaea doesn't compute them.
     tint_output_name: str = DEFAULT_TINT_OUTPUT
-    build_tint: bool = True
+    build_tint: bool = False
 
     @property
     def builds_copy(self):
@@ -667,7 +665,8 @@ def check_project_paths(config, fix_mask_paths=False):
     """
     if not config.gaea_project:
         return ["No Gaea project: set Gaea Project, or put {} (or any project with "
-                "an {} node) into Gaea Projects Dir.".format(
+                "an {} node) into the scene folder or next to houdini_gaea_bridge.py "
+                "(subfolders are searched).".format(
                     project_name_for_kind(config.erosion_kind), config.erosion_kind)]
     if not os.path.isfile(config.gaea_project):
         return ["Gaea project not found: {!r}.".format(config.gaea_project)]
@@ -1876,7 +1875,7 @@ def open_in_gaea(config=None):
 
 # Paths that are the same for every bridge node of a user: set on one node, they
 # are saved to the user settings and used by every node whose own field is empty.
-SHARED_PATH_KEYS = ("gaea_exe", "gaea_swarm", "gaea_projects_dir")
+SHARED_PATH_KEYS = ("gaea_exe", "gaea_swarm")
 USER_SETTINGS_NAME = "gh_bridge_user_settings.json"
 
 
@@ -1972,18 +1971,36 @@ def find_project_for_kind(folder, kind):
     return None
 
 
-def resolve_project(config):
+def project_search_folders():
+    """Where a bridge node looks for its project (each with subfolders): the
+    saved scene's folder, then the folder of this module."""
+    folders = []
+    try:
+        import hou
+        hip = hou.text.expandString("$HIP")
+        if hip and os.path.isdir(hip):
+            folders.append(os.path.normpath(hip))
+    except ImportError:
+        pass
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in folders:
+        folders.append(here)
+    return folders
+
+
+def resolve_project(config, folders=None):
     """Fill an empty ``config.gaea_project`` with the project found for its
-    erosion kind in Gaea Projects Dir (without one: next to this module).
-    Returns ``(how, where)``: ("set", path), ("auto", path) or ("none", folder)."""
+    erosion kind in ``folders`` (default: project_search_folders()). Returns
+    ``(how, where)``: ("set", path), ("auto", path) or ("none", folders)."""
     if config.gaea_project:
         return "set", config.gaea_project
-    folder = config.gaea_projects_dir or os.path.dirname(os.path.abspath(__file__))
-    found = find_project_for_kind(folder, config.erosion_kind)
-    if found:
-        config.gaea_project = found
-        return "auto", found
-    return "none", folder
+    folders = project_search_folders() if folders is None else list(folders)
+    for folder in folders:
+        found = find_project_for_kind(folder, config.erosion_kind)
+        if found:
+            config.gaea_project = found
+            return "auto", found
+    return "none", folders
 
 
 # --------------------------------------------------------------------------- #
@@ -2012,7 +2029,6 @@ def overrides_from_node(node):
         "bridge_dir": _eval("bridge_dir", None, as_string=True) or None,
         "downsample": int(downsample) if downsample else None,
         "gaea_project": _eval("gaea_project", None, as_string=True) or None,
-        "gaea_projects_dir": _eval("gaea_projects_dir", None, as_string=True) or None,
         "gaea_exe": _eval("gaea_exe", None, as_string=True) or None,
         "gaea_width": _eval("gaea_width", None),
         "gaea_height": _eval("gaea_height", None),
@@ -2173,8 +2189,8 @@ def config_from_node(node):
 
 
 def on_shared_path_changed(node):
-    """Callback of Gaea Exe / Gaea Swarm Exe / Gaea Projects Dir: save them for
-    every bridge node, then show the paths in effect."""
+    """Callback of Gaea Exe / Gaea Swarm Exe: save them for every bridge node,
+    then show the paths in effect."""
     values = {}
     for key in SHARED_PATH_KEYS:
         parm = node.parm(key)
@@ -2202,12 +2218,11 @@ def show_paths(node, prefix=""):
     if how == "set":
         parts.append(entry("Project", where))
     elif how == "auto":
-        parts.append("Project: {} (found for {} in {})".format(
-            where, config.erosion_kind, config.gaea_projects_dir or "the module folder"))
+        parts.append("Project: {} (found for {})".format(where, config.erosion_kind))
     else:
-        parts.append("Project: none found for {} in {}. Put {} there (or any project "
-                     "with an {} node), or set Gaea Project.".format(
-                         config.erosion_kind, where,
+        parts.append("Project: none found for {} in {} (and subfolders). Put {} there "
+                     "(or any project with an {} node), or set Gaea Project.".format(
+                         config.erosion_kind, " or ".join(where),
                          project_name_for_kind(config.erosion_kind), config.erosion_kind))
     message = prefix + "  ".join(parts)
     _set_parm_if_present(node, "_status_paths", message)

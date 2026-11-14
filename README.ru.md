@@ -55,9 +55,9 @@ HeightField ─▶ input_height.exr ─▶ Gaea: File ─▶ Erosion2 ─▶ Exp
 ## Использование
 
 1. Подключите к ноде HeightField (и при желании маску).
-2. Вкладка **Paths**, один раз: **Gaea Exe** и **Gaea Projects Dir** (ваша папка с
-   `.terrain`). Оба общие для всех нод-мостов. Проект каждая нода находит там сама
-   (`erosion2.terrain` / `erosion.terrain`, иначе любой проект с такой нодой);
+2. Вкладка **Paths**, один раз: **Gaea Exe** (общий для всех нод-мостов). Проект каждая
+   нода находит сама (`erosion2.terrain` / `erosion.terrain`, иначе любой проект с такой
+   нодой) в папке сцены или рядом с `houdini_gaea_bridge.py`, включая подпапки;
    **Gaea Project** задавайте только ради конкретного файла. **Check Paths** показывает,
    что используется.
 3. Нажмите **Export > Build > Import**.
@@ -68,8 +68,8 @@ HeightField ─▶ input_height.exr ─▶ Gaea: File ─▶ Erosion2 ─▶ Exp
 - **Erosion** — *Use Erosion Template* открывает все параметры ноды эрозии проекта
   (Erosion2 или Erosion, смотря какая нода-мост); *Auto Build on
   Change* пересобирает после каждой правки (нода заблокирована до импорта).
-- **Tint** — *Build Tint* собирает `output_tint_combine` с настройками Tint из самого
-  проекта; без галки ноды тинта в сборку не попадают вообще. **Show / Hide Tint**
+- **Tint** — *Build Tint* (по умолчанию выключена) собирает `output_tint_combine` с
+  настройками Tint из самого проекта; без галки ноды тинта в сборку не попадают вообще. **Show / Hide Tint**
   показывает карту как маску Terrain (яркость).
 - **Gaea Layers** — превью Show Mask, для каждой маски Normalize / Range / Gamma / Blur,
   Keep Input Resolution.

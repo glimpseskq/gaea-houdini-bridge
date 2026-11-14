@@ -514,10 +514,11 @@ class SharedPathsTests(unittest.TestCase):
             self.settings)
         self.assertEqual(saved, {"gaea_exe": "E:/Gaea/Gaea.exe"})
         # Empty values keep what is saved; other keys in the file survive.
-        ghb.save_shared_paths({"gaea_exe": "", "gaea_projects_dir": "D:/P"},
+        ghb.save_shared_paths({"gaea_exe": "", "gaea_swarm": "E:/Gaea/Gaea.Swarm.exe"},
                               self.settings)
         self.assertEqual(ghb.load_shared_paths(self.settings),
-                         {"gaea_exe": "E:/Gaea/Gaea.exe", "gaea_projects_dir": "D:/P"})
+                         {"gaea_exe": "E:/Gaea/Gaea.exe",
+                          "gaea_swarm": "E:/Gaea/Gaea.Swarm.exe"})
 
     def test_shared_paths_fill_only_empty_fields(self):
         cfg = ghb.BridgeConfig(gaea_exe="C:/mine/Gaea.exe")
@@ -570,16 +571,21 @@ class SharedPathsTests(unittest.TestCase):
         self.assertTrue(ghb._same_path(copy["2"]["FileName"], cfg.mask_input_path))
 
     def test_resolve_project_fills_an_empty_setting(self):
-        found = self._project("erosion.terrain", "Erosion")
-        cfg = ghb.BridgeConfig(erosion_kind="Erosion", gaea_projects_dir=self.tmp)
-        self.assertEqual(ghb.resolve_project(cfg), ("auto", found))
+        found = self._project("sub/erosion.terrain", "Erosion")
+        empty = os.path.join(self.tmp, "empty")
+        os.makedirs(empty)
+        cfg = ghb.BridgeConfig(erosion_kind="Erosion")
+        self.assertEqual(ghb.resolve_project(cfg, [empty, self.tmp]), ("auto", found))
         self.assertEqual(cfg.gaea_project, found)
-        explicit = ghb.BridgeConfig(gaea_project="D:/x.terrain",
-                                    gaea_projects_dir=self.tmp)
-        self.assertEqual(ghb.resolve_project(explicit), ("set", "D:/x.terrain"))
-        none = ghb.BridgeConfig(erosion_kind="Erosion2", gaea_projects_dir=self.tmp)
-        self.assertEqual(ghb.resolve_project(none), ("none", self.tmp))
-        self.assertIn("Gaea Projects Dir", " ".join(ghb.check_project_paths(none)))
+        explicit = ghb.BridgeConfig(gaea_project="D:/x.terrain")
+        self.assertEqual(ghb.resolve_project(explicit, [self.tmp]), ("set", "D:/x.terrain"))
+        none = ghb.BridgeConfig(erosion_kind="Erosion2")
+        self.assertEqual(ghb.resolve_project(none, [empty]), ("none", [empty]))
+        self.assertIn("erosion2.terrain", " ".join(ghb.check_project_paths(none)))
+        # The default search covers this module's folder, where the sample
+        # projects live.
+        self.assertIn(os.path.dirname(os.path.abspath(ghb.__file__)),
+                      ghb.project_search_folders())
 
 
 class _Vector3:
@@ -740,7 +746,7 @@ class TintTests(unittest.TestCase):
 
     def test_build_tint_on_keeps_the_chain_and_fixes_its_export(self):
         self._project()
-        self.cfg.use_template = True  # a copy is built anyway
+        self.cfg.build_tint = True  # off by default
         dst = os.path.join(self.tmp, "copy.terrain")
         changed = ghb.write_template_copy(self.cfg, dst)
         self.assertFalse(any(name.startswith("tint skipped") for name in changed))
@@ -805,8 +811,9 @@ class TintTests(unittest.TestCase):
 
     def test_build_tint_in_cache_signature(self):
         self._project()
+        self.assertFalse(self.cfg.build_tint)  # off by default
         first = ghb.build_settings(self.cfg)
-        self.cfg.build_tint = False
+        self.cfg.build_tint = True
         self.assertNotEqual(first, ghb.build_settings(self.cfg))
 
 
