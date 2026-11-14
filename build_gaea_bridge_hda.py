@@ -545,7 +545,7 @@ def _tint_tab():
     themselves are the Gaea project's own."""
     tab = hou.FolderParmTemplate("tint_tab", "Tint", folder_type=hou.folderType.Tabs)
     tab.addParmTemplate(hou.ToggleParmTemplate(
-        "build_tint", "Build Tint", default_value=True,
+        "build_tint", "Build Tint", default_value=False,
         script_callback=EROSION_CHANGED_CALLBACK,
         script_callback_language=hou.scriptLanguage.Python,
         help="Build the Tint color map too (the Export node output_tint_combine, "
@@ -680,18 +680,12 @@ def _build_parm_template_group(node_kind="Erosion2"):
     shared_note = (" Shared: set it on one bridge node and every node whose field "
                    "is empty uses it.")
     paths.addParmTemplate(hou.StringParmTemplate(
-        "gaea_projects_dir", "Gaea Projects Dir", 1, default_value=("",),
-        string_type=hou.stringParmType.FileReference,
-        file_type=hou.fileType.Directory,
-        help="Folder with your Gaea projects (subfolders included). With Gaea Project "
-             "empty, this node finds its project there by itself: {0}.terrain first, "
-             "else any project with a {1} node.{2}".format(
-                 node_kind.lower(), node_kind, shared_note), **shared))
-    paths.addParmTemplate(hou.StringParmTemplate(
         "gaea_project", "Gaea Project (.terrain)", 1, default_value=("",),
         string_type=hou.stringParmType.FileReference,
-        help="Empty = found automatically in Gaea Projects Dir (see there). Set it "
-             "to use a specific project."))
+        help="Empty = found automatically: {0}.terrain, else any project with a {1} "
+             "node, in the scene folder ($HIP) or next to houdini_gaea_bridge.py "
+             "(subfolders included). Set it to use a specific project.".format(
+                 node_kind.lower(), node_kind)))
     paths.addParmTemplate(hou.StringParmTemplate(
         "gaea_exe", "Gaea Exe", 1, default_value=("",),
         string_type=hou.stringParmType.FileReference,

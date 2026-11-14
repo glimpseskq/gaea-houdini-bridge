@@ -55,11 +55,11 @@ never has to point at the bridge folder. Each bridge node works in its own folde
 ## Usage
 
 1. Connect a HeightField (and optionally a mask) to the node.
-2. **Paths** tab, once: **Gaea Exe** and **Gaea Projects Dir** (your folder of
-   `.terrain` files). Both are shared by every bridge node. Each node finds its project
-   there by itself (`erosion2.terrain` / `erosion.terrain`, else any project with that
-   node); set **Gaea Project** only to pick a specific file. **Check Paths** shows what
-   is in use.
+2. **Paths** tab, once: **Gaea Exe** (shared by every bridge node). Each node finds its
+   project by itself (`erosion2.terrain` / `erosion.terrain`, else any project with that
+   node) in the scene folder or next to `houdini_gaea_bridge.py`, subfolders included;
+   set **Gaea Project** only to pick a specific file. **Check Paths** shows what is in
+   use.
 3. Press **Export > Build > Import**.
 
 Tabs:
@@ -68,8 +68,8 @@ Tabs:
 - **Erosion** — *Use Erosion Template* exposes all parameters of the project's erosion
   node (Erosion2 or Erosion, depending on the bridge node); *Auto Build on
   Change* rebuilds after every edit (the node is locked until the import).
-- **Tint** — *Build Tint* builds `output_tint_combine` with the project's own Tint
-  settings; off, the tint nodes are left out of the build entirely. **Show / Hide Tint**
+- **Tint** — *Build Tint* (off by default) builds `output_tint_combine` with the
+  project's own Tint settings; off, the tint nodes are left out of the build entirely. **Show / Hide Tint**
   shows the map as the Terrain's mask (luminance).
 - **Gaea Layers** — Show Mask preview, per-mask Normalize / Range / Gamma / Blur,
   Keep Input Resolution.
