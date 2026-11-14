@@ -2,20 +2,23 @@
 
 [English](README.md) | **Русский**
 
-Нода Houdini, которая отправляет HeightField в **Gaea 2**, собирает проект Gaea через
-`Gaea.Swarm.exe` (Gaea не открывается) и возвращает в Houdini эродированный рельеф, его
-маски и карты тинтов.
+Ноды Houdini, которые отправляют HeightField в **Gaea 2**, собирают проект Gaea через
+`Gaea.Swarm.exe` (Gaea не открывается) и возвращают результат в Houdini: эродированный
+рельеф с масками (Erosion2 / Erosion) или цветовую карту (SuperColor).
 
 ```
-HeightField ─▶ input_height.exr ─▶ Gaea: File ─▶ Erosion2 ─▶ Export-ноды
-Рельеф + маски ◀── output/output_*.exr ◀──────────────────────────┘
+HeightField ─▶ input_height.exr ─▶ Gaea: File ─▶ Erosion2 / SuperColor ─▶ Export-ноды
+Рельеф + маски / цвет ◀── output/output_*.exr ◀─────────────────────────────┘
 ```
 
 ## Возможности
 
 - **Одна кнопка**: Export > Build > Import, в фоне.
-- **Четыре выхода**: Terrain, Flow, Wear, Sediment (маски готовы для HeightField-нод).
-- **Параметры Erosion2 / Erosion в Houdini**: меняете и пересобираете; сам проект Gaea
+- **Эрозионные ноды, четыре выхода**: Terrain, Flow, Wear, Sediment (маски готовы для
+  HeightField-нод).
+- **Нода SuperColor**: цветовая карта как текстурированный меш (или цвет точек) и как
+  слои `color_r/g/b` HeightField; выбранная палитра Gaea видна прямо в Houdini.
+- **Параметры ноды Gaea в Houdini**: меняете и пересобираете; сам проект Gaea
   не меняется (собирается копия).
 - **Вход маски**: второй вход ограничивает, где Gaea размывает (любая маска или геометрия).
 - **Масштаб 1:1**, разрешение экспорта Full–1/4, сборка до 16K, кэш сборок.
@@ -32,20 +35,21 @@ HeightField ─▶ input_height.exr ─▶ Gaea: File ─▶ Erosion2 ─▶ Exp
    ```python
    exec(open(r"C:/path/to/BridgeHGH/build_gaea_bridge_hda.py").read())
    ```
-   В меню Tab появятся две ноды: **Gaea Erosion2 Bridge** (для проекта с Erosion2) и
-   **Gaea Erosion Bridge** (для старой ноды Erosion). Работают одинаково, у каждой
-   параметры своей ноды.
+   В меню Tab появятся три ноды: **Gaea Erosion2 Bridge**, **Gaea Erosion Bridge**
+   (старая нода Erosion) и **Gaea SuperColor Bridge**. Работают одинаково, у каждой
+   параметры своей ноды Gaea.
 
 ## Проект Gaea (один раз)
 
-`File` (любой путь, мост выставит сам) → **Erosion2** (или **Erosion**) → Export-ноды
-с именами:
+`File` (любой путь, мост выставит сам) → **Erosion2** / **Erosion** / **SuperColor** →
+Export-ноды с именами:
 
-| Выход Erosion2 | Export-нода |
-|----------------|-------------|
-| Out / Flow / Wear / Deposits | `output_height` / `output_flow` / `output_wear` / `output_sediment` |
+| Выход Gaea | Export-нода |
+|------------|-------------|
+| Erosion2 Out / Flow / Wear / Deposits | `output_height` / `output_flow` / `output_wear` / `output_sediment` |
 | цветовая карта (ноды Tint → Combine), необязательно | `output_tint_combine` |
-| порт Mask ← вторая `File`-нода | читает `<Bridge Dir>/input_mask.exr` |
+| SuperColor Out | `output_supercolor` |
+| порт Mask / Texture ← вторая `File`-нода | читает `<Bridge Dir>/input_mask.exr` |
 
 Формат экспорта EXR. Мост собирает копию проекта и сам выставляет в ней все пути
 (входной File, File маски, Export-ноды), так что сохранённый проект не меняется и не
@@ -56,8 +60,9 @@ HeightField ─▶ input_height.exr ─▶ Gaea: File ─▶ Erosion2 ─▶ Exp
 
 1. Подключите к ноде HeightField (и при желании маску).
 2. Вкладка **Paths**, один раз: **Gaea Exe** (общий для всех нод-мостов). Проект каждая
-   нода находит сама (`erosion2.terrain` / `erosion.terrain`, иначе любой проект с такой
-   нодой) в папке сцены или рядом с `houdini_gaea_bridge.py`, включая подпапки;
+   нода находит сама (`erosion2.terrain` / `erosion.terrain` / `supercolor.terrain`,
+   иначе любой проект с такой нодой) в папке сцены или рядом с
+   `houdini_gaea_bridge.py`, включая подпапки;
    **Gaea Project** задавайте только ради конкретного файла. **Check Paths** показывает,
    что используется.
 3. Нажмите **Export > Build > Import**.
@@ -65,14 +70,21 @@ HeightField ─▶ input_height.exr ─▶ Gaea: File ─▶ Erosion2 ─▶ Exp
 Вкладки:
 
 - **Bridge** — разрешение экспорта, опции сборки, пошаговые кнопки, Auto Import.
-- **Erosion** — *Use Erosion Template* открывает все параметры ноды эрозии проекта
-  (Erosion2 или Erosion, смотря какая нода-мост); *Auto Build on
-  Change* пересобирает после каждой правки (нода заблокирована до импорта).
-- **Tint** — *Build Tint* (по умолчанию выключена) собирает `output_tint_combine` с
-  настройками Tint из самого проекта; без галки ноды тинта в сборку не попадают вообще. **Show / Hide Tint**
-  показывает карту как маску Terrain (яркость).
-- **Gaea Layers** — превью Show Mask, для каждой маски Normalize / Range / Gamma / Blur,
-  Keep Input Resolution.
+- **Erosion** / **SuperColor** — *Use ... Template* открывает все параметры ноды Gaea
+  из проекта; *Auto Build on Change* пересобирает после каждой правки (нода
+  заблокирована до импорта). У SuperColor видна выбранная палитра (читается из
+  `Resources/Color/*.clut` Gaea); **Choose Palette...** открывает окно со всеми
+  палитрами библиотеки в виде миниатюр, клик выбирает.
+- **Tint** (эрозионные ноды) — *Build Tint* (по умолчанию выключена) собирает
+  `output_tint_combine` с настройками Tint из самого проекта; без галки ноды тинта в
+  сборку не попадают вообще. **Show / Hide Tint** показывает карту как маску Terrain
+  (яркость).
+- **Gaea Layers** (эрозионные ноды) — превью Show Mask, для каждой маски Normalize /
+  Range / Gamma / Blur, Keep Input Resolution.
+- **Color** (SuperColor) — выход 1: HeightField полигонами с цветовой картой как
+  текстурой (*Color Mode: Texture*, Principled Shader внутри ноды) или цветом точек
+  (*Point Color*); *Mesh Resolution* ограничивает число полигонов по оси. Выход 2:
+  HeightField со слоями `color_r` / `color_g` / `color_b`.
 
 ## Тесты
 

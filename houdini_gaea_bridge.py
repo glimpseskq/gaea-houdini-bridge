@@ -65,6 +65,14 @@ DEFAULT_OUTPUT_MAPS = {
 # on the terrain on request (Tint tab), never imported as a layer.
 DEFAULT_TINT_OUTPUT = "output_tint_combine.exr"
 
+# Color bridges (Gaea SuperColor Bridge): the project writes one RGB map instead
+# of height + masks. It is shown as a texture on a polygon mesh and split into
+# color_r / color_g / color_b HeightField layers; never a height.
+COLOR_OUTPUT_MAPS = {"supercolor": "output_supercolor.exr"}
+COLOR_LAYERS = tuple(COLOR_OUTPUT_MAPS)
+# Node kind -> the Export nodes its bridge expects (other kinds: DEFAULT_OUTPUT_MAPS).
+KIND_OUTPUT_MAPS = {"SuperColor": COLOR_OUTPUT_MAPS}
+
 # Mask layers (everything but height) are normalized to 0..1 on import, and one of
 # them can be copied into the "mask" layer, which Houdini draws in the viewport and
 # which HeightField nodes use by default.
@@ -168,6 +176,12 @@ class BridgeConfig:
     def output_path(self, layer_name):
         return os.path.join(self.output_dir, self.output_maps[layer_name])
 
+    @property
+    def primary_output(self):
+        """The one Export the project must have: "height", or the first map of
+        a color bridge ("supercolor")."""
+        return primary_output(self.output_maps)
+
     # -- serialization ----------------------------------------------------- #
 
     def to_dict(self):
@@ -197,6 +211,17 @@ class BridgeConfig:
         if overrides:
             data.update({k: v for k, v in overrides.items() if v is not None})
         return cls.from_dict(data)
+
+
+def output_maps_for_kind(kind):
+    """The output maps a bridge for Gaea node ``kind`` imports."""
+    return dict(KIND_OUTPUT_MAPS.get(kind, DEFAULT_OUTPUT_MAPS))
+
+
+def primary_output(output_maps):
+    if "height" in output_maps:
+        return "height"
+    return next(iter(output_maps), "height")
 
 
 # --------------------------------------------------------------------------- #
@@ -389,26 +414,30 @@ _FRESH_COUNTER = itertools.count()
 
 
 def tint_display_path(config, source, fresh=False):
-    """The Tint map under a name unique to this build, for display.
-    ``fresh``: a name never used before (Show / Hide Tint).
+    """The Tint map under a name unique to this build (see display_path).
+    ``fresh``: a name never used before (Show / Hide Tint)."""
+    return display_path(config, source, "tint_", fresh)
 
-    Gaea rewrites output_tint_<layer>.exr under the same name, and Houdini's
-    viewport keeps showing the texture it loaded for a path. So the display uses
-    <Bridge Dir>/tint_display/tint_<layer>_<build stamp>.exr: a hard link to the
+
+def display_path(config, source, prefix, fresh=False):
+    """A map under a name unique to this build, for display as a texture.
+
+    Gaea rewrites output_*.exr under the same name, and Houdini's viewport keeps
+    showing the texture it loaded for a path. So the display uses
+    <Bridge Dir>/tint_display/<prefix><build stamp>.exr: a hard link to the
     output (no copy, no extra space), or a copy where links are not possible.
-    Older maps of the layer are removed (if Windows still holds one open, it is
-    left for next time). Falls back to ``source`` on any error.
+    Older maps with the same prefix are removed (if Windows still holds one
+    open, it is left for next time). Falls back to ``source`` on any error.
     """
     try:
         info = os.stat(source)
         folder = os.path.join(config.bridge_dir, TINT_DISPLAY_SUBDIR)
         os.makedirs(folder, exist_ok=True)
-        prefix = "tint_"
         name = "{}{}_{}".format(prefix, info.st_mtime_ns, info.st_size)
         if fresh:  # never reused in a session, even within the same millisecond
             name += "_r{}_{}".format(time.time_ns(), next(_FRESH_COUNTER))
         name += ".exr"
-        target = os.path.join(folder, name)
+        target = os.path.join(folder, name).replace("\\", "/")  # a texture path
         if not os.path.isfile(target):
             try:
                 os.link(source, target)
@@ -573,15 +602,19 @@ def _collect_nodes(data, kind, found):
     return found
 
 
+MASK_PORT_NAMES = ("mask", "texture")  # Erosion2 / Erosion "Mask", SuperColor "Texture"
+
+
 def mask_file_nodes(data):
-    """File nodes of a .terrain that feed a port named "Mask" (e.g. Erosion2's)."""
+    """File nodes of a .terrain that feed a port named "Mask" (e.g. Erosion2's)
+    or "Texture" (SuperColor's): they read the bridge's mask input."""
     sources = set()
 
     def walk(value):
         if isinstance(value, dict):
             record = value.get("Record")
             if isinstance(record, dict) and str(record.get("ToPort", "")).strip() \
-                    .casefold() == "mask":
+                    .casefold() in MASK_PORT_NAMES:
                 sources.add(record.get("From"))
             for child in value.values():
                 walk(child)
@@ -718,9 +751,10 @@ def check_project_paths(config, fix_mask_paths=False):
         if node.get("Format", "EXR") != "EXR":
             problems.append("Export node {!r} should use Format EXR (is {}).".format(
                 name, node.get("Format")))
-    if "height" not in matched:
+    primary = config.primary_output
+    if primary not in matched:
         problems.append("No Export node named {!r} in the project.".format(
-            os.path.splitext(config.output_maps.get("height", "output_height"))[0]))
+            os.path.splitext(config.output_maps.get(primary, "output_height"))[0]))
     return problems
 
 
@@ -868,8 +902,32 @@ EROSION1_PARAMS = (
     ("Deterministic", "Deterministic", "Other Settings", "bool", False, 0, 1),
 )
 
-# Erosion node kind (Gaea node type name) -> its parameter spec.
-EROSION_SPECS = {"Erosion2": EROSION2_PARAMS, "Erosion": EROSION1_PARAMS}
+# SuperColor (QuadSpinner.Gaea.Nodes.SuperColor, Gaea 2.3): a color map from a
+# palette of Gaea's CLUT library. Range is a Float2 ("float2": default (x, y),
+# min, max per component; stored as {"X": .., "Y": ..}). The palette itself is
+# only an index into Gaea's Resources/Color/<Library>.clut (see read_clut).
+# Randomize (a button) and Data (not saved) are skipped.
+SUPERCOLOR_TEXTURE = ("None", "Texture", "Peaks", "Flow")
+SUPERCOLOR_LIBRARY = ("New", "Rock", "Sand", "Green", "Blue", "Color")
+SUPERCOLOR_PROCESS = ("Basic", "Erosion", "Third")
+SUPERCOLOR_AMOUNT = ("Low", "Med", "High", "Ultra")
+SUPERCOLOR_PARAMS = (
+    ("Texture", "Texture", "Texture", "enum", "Peaks", SUPERCOLOR_TEXTURE, None),
+    ("Strength", "Strength", "Texture", "float", 0.5, 0.0, 1.0),
+    ("Warp", "Warp", "Texture", "float", 0.0, 0.0, 1.0),
+    ("Seed", "Seed", "Texture", "int", 0, 0, 65535),
+    ("Library", "Library", "Color", "enum", "Rock", SUPERCOLOR_LIBRARY, None),
+    ("LibraryItem", "Palette", "Color", "int", 0, 0, 999),
+    ("Range", "Range", "Color", "float2", (0.0, 1.0), 0.0, 1.0),
+    ("Bias", "Bias", "Color", "float", 0.0, -1.0, 1.0),
+    ("Reverse", "Reverse", "Color", "bool", False, 0, 1),
+    ("Process", "Process", "Process", "enum", "Erosion", SUPERCOLOR_PROCESS, None),
+    ("Amount", "Amount", "Process", "enum", "Low", SUPERCOLOR_AMOUNT, None),
+)
+
+# Gaea node kind (type name) -> its parameter spec: one bridge HDA per kind.
+EROSION_SPECS = {"Erosion2": EROSION2_PARAMS, "Erosion": EROSION1_PARAMS,
+                 "SuperColor": SUPERCOLOR_PARAMS}
 
 
 def erosion_spec(kind):
@@ -899,6 +957,11 @@ def _coerce_kind(kind, value):
         return tuple(float(component) for component in value)[:3]
     if kind == "enum":
         return str(value)
+    if kind == "float2":
+        if isinstance(value, dict):  # Gaea leaves out components equal to 0
+            value = (value.get("X", 0.0), value.get("Y", 0.0))
+        x, y = (float(component) for component in value)
+        return (x, y)
     return float(value)
 
 
@@ -906,7 +969,7 @@ def _same_kind(kind, a, b):
     a, b = _coerce_kind(kind, a), _coerce_kind(kind, b)
     if kind == "float":
         return abs(a - b) <= 1e-6 * max(1.0, abs(a), abs(b))
-    if kind == "color":
+    if kind in ("color", "float2"):
         return all(abs(x - y) <= 1e-6 for x, y in zip(a, b))
     return a == b
 
@@ -916,6 +979,8 @@ def _to_gaea(kind, value):
     value = _coerce_kind(kind, value)
     if kind == "color":
         return {"R": value[0], "G": value[1], "B": value[2]}
+    if kind == "float2":
+        return {"X": value[0], "Y": value[1]}
     return value
 
 
@@ -1060,6 +1125,94 @@ def apply_node_params(node, specs, values):
 def _load_project(path):
     with open(path, "r", encoding="utf-8-sig") as handle:
         return json.load(handle)
+
+
+# --------------------------------------------------------------------------- #
+# SuperColor palettes: Gaea's CLUT library (Resources/Color/<Library>.clut)
+# --------------------------------------------------------------------------- #
+
+CLUT_STRIP_WIDTH = 512  # each palette: 512 RGB8 pixels
+CLUT_ENTRY_SIZE = CLUT_STRIP_WIDTH * 3
+CLUT_HEADER_SIZE = 4    # little-endian int32: number of palettes
+
+
+def clut_path(gaea_exe, library):
+    """Path of a Gaea palette library file next to Gaea.exe, or ""."""
+    if not gaea_exe:
+        return ""
+    return os.path.join(os.path.dirname(gaea_exe), "Resources", "Color",
+                        "{}.clut".format(library))
+
+
+def clut_count(path):
+    """Number of palettes in a .clut file (0 when unreadable)."""
+    try:
+        with open(path, "rb") as handle:
+            header = handle.read(CLUT_HEADER_SIZE)
+        if len(header) < CLUT_HEADER_SIZE:
+            return 0
+        count = int.from_bytes(header, "little")
+        return count if 0 < count * CLUT_ENTRY_SIZE + CLUT_HEADER_SIZE <= \
+            os.path.getsize(path) else 0
+    except OSError:
+        return 0
+
+
+def read_clut(path, index, samples=16, reverse=False):
+    """Palette ``index`` of a .clut file as ``samples`` evenly spaced (r, g, b)
+    tuples in 0..1 (sRGB bytes converted to linear, as Houdini's ramps expect),
+    or None when the file or the index is not there."""
+    count = clut_count(path)
+    if index < 0 or index >= count:
+        return None
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(CLUT_HEADER_SIZE + index * CLUT_ENTRY_SIZE)
+            strip = handle.read(CLUT_ENTRY_SIZE)
+    except OSError:
+        return None
+    if len(strip) < CLUT_ENTRY_SIZE:
+        return None
+    samples = max(2, int(samples))
+    colors = []
+    for i in range(samples):
+        pixel = int(round(i * (CLUT_STRIP_WIDTH - 1) / float(samples - 1)))
+        if reverse:
+            pixel = CLUT_STRIP_WIDTH - 1 - pixel
+        colors.append(tuple(_srgb_to_linear(strip[pixel * 3 + c] / 255.0)
+                            for c in range(3)))
+    return colors
+
+
+def read_clut_strips(path, reverse=False):
+    """Every palette of a .clut file as its raw sRGB strip (bytes of
+    CLUT_ENTRY_SIZE, 512 RGB8 pixels), in file order; [] when unreadable.
+    These are the thumbnails of the palette picker."""
+    count = clut_count(path)
+    if not count:
+        return []
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(CLUT_HEADER_SIZE)
+            data = handle.read(count * CLUT_ENTRY_SIZE)
+    except OSError:
+        return []
+    strips = [data[i * CLUT_ENTRY_SIZE:(i + 1) * CLUT_ENTRY_SIZE] for i in range(count)]
+    strips = [strip for strip in strips if len(strip) == CLUT_ENTRY_SIZE]
+    if reverse:
+        strips = [_reverse_strip(strip) for strip in strips]
+    return strips
+
+
+def _reverse_strip(strip):
+    pixels = [strip[i:i + 3] for i in range(0, len(strip), 3)]
+    return b"".join(reversed(pixels))
+
+
+def _srgb_to_linear(value):
+    if value <= 0.04045:
+        return value / 12.92
+    return ((value + 0.055) / 1.055) ** 2.4
 
 
 def read_erosion_params(path, node_name="", kind="Erosion2"):
@@ -2025,9 +2178,12 @@ def overrides_from_node(node):
     mask_layer = _eval("mask_layer", None, as_string=True)
     if mask_layer == "none":
         mask_layer = ""
+    kind = node_erosion_kind(node)
     return {
         "bridge_dir": _eval("bridge_dir", None, as_string=True) or None,
         "downsample": int(downsample) if downsample else None,
+        # Color bridges import their color map instead of height + masks.
+        "output_maps": output_maps_for_kind(kind) if kind in KIND_OUTPUT_MAPS else None,
         "gaea_project": _eval("gaea_project", None, as_string=True) or None,
         "gaea_exe": _eval("gaea_exe", None, as_string=True) or None,
         "gaea_width": _eval("gaea_width", None),
@@ -2040,7 +2196,7 @@ def overrides_from_node(node):
         "show_console": _bool_or_none(_eval("show_console", None)),
         "use_template": _bool_or_none(_eval("use_template", None)),
         "erosion_node": _eval("erosion_node", None, as_string=True),
-        "erosion_kind": node_erosion_kind(node),
+        "erosion_kind": kind,
         "erosion_params": _erosion_params_from_node(node) or None,
         "build_tint": _bool_or_none(_eval("build_tint", None)),
     }
@@ -2062,7 +2218,10 @@ def _erosion_params_from_node(node):
     skipped)."""
     values = {}
     for name, kind in erosion_types(node_erosion_kind(node)).items():
-        parm = node.parm(EROSION_PARM_PREFIX + name)
+        if kind == "float2":
+            parm = node.parmTuple(EROSION_PARM_PREFIX + name)
+        else:
+            parm = node.parm(EROSION_PARM_PREFIX + name)
         if parm is not None:
             values[name] = _coerce_kind(
                 kind, parm.evalAsString() if kind == "enum" else parm.eval())
@@ -2086,14 +2245,337 @@ def read_template_into_node(node, defaults=False):
                                      erosion_kind)
         source = os.path.basename(config.gaea_project)
     for name, value in values.items():
-        parm = node.parm(EROSION_PARM_PREFIX + name)
+        if isinstance(value, tuple):
+            parm = node.parmTuple(EROSION_PARM_PREFIX + name)
+        else:
+            parm = node.parm(EROSION_PARM_PREFIX + name)
         if parm is not None:
             parm.set(int(value) if isinstance(value, bool) else value)
     if node.parm("_ero_loaded") is not None:
         node.parm("_ero_loaded").set(1)
-    message = "Erosion parameters loaded from {}.".format(source)
+    update_palette_preview(node)
+    message = "{} parameters loaded from {}.".format(erosion_kind, source)
     _set_status(node, message)
     return message
+
+
+PALETTE_PREVIEW_PARM = "palette_preview"
+PALETTE_INFO_PARM = "_palette_info"
+
+
+def update_palette_preview(node):
+    """SuperColor bridge: show the chosen Gaea palette (Library + Palette index,
+    Reverse) in the node's preview ramp, read from Gaea's own .clut files next
+    to Gaea Exe. Returns the info text (also written to the info field)."""
+    import hou
+
+    ramp_parm = node.parm(PALETTE_PREVIEW_PARM)
+    if ramp_parm is None:
+        return ""
+    library_parm = node.parm(EROSION_PARM_PREFIX + "Library")
+    index_parm = node.parm(EROSION_PARM_PREFIX + "LibraryItem")
+    reverse_parm = node.parm(EROSION_PARM_PREFIX + "Reverse")
+    library = library_parm.evalAsString() if library_parm is not None else "Rock"
+    index = int(index_parm.eval()) if index_parm is not None else 0
+    reverse = bool(reverse_parm.eval()) if reverse_parm is not None else False
+    config = BridgeConfig.load(overrides=overrides_from_node(node))
+    apply_shared_paths(config)
+    path = clut_path(config.gaea_exe, library)
+    count = clut_count(path) if path else 0
+    colors = read_clut(path, index, reverse=reverse) if count else None
+    if colors is None:
+        gray = ((0.3, 0.3, 0.3), (0.3, 0.3, 0.3))
+        ramp = hou.Ramp((hou.rampBasis.Linear,) * 2, (0.0, 1.0), gray)
+        if not count:
+            info = "Palette preview needs Gaea Exe (Paths tab): {}.clut not found.".format(
+                library)
+        else:
+            info = "{} has palettes 0..{}; {} is out of range.".format(
+                library, count - 1, index)
+    else:
+        keys = tuple(i / float(len(colors) - 1) for i in range(len(colors)))
+        ramp = hou.Ramp((hou.rampBasis.Linear,) * len(colors), keys, tuple(colors))
+        info = "{} palette {} of 0..{}{}".format(library, index, count - 1,
+                                                  " (reversed)" if reverse else "")
+    ramp_parm.set(ramp)
+    _set_parm_if_present(node, PALETTE_INFO_PARM, info)
+    return info
+
+
+def on_supercolor_parm_changed(node):
+    """Callback of every SuperColor parameter: refresh the palette preview, then
+    Auto Build on Change like the erosion values."""
+    update_palette_preview(node)
+    _sync_palette_picker(node)
+    return on_erosion_parm_changed(node)
+
+
+# --------------------------------------------------------------------------- #
+# SuperColor palette picker: a window with every palette of a Library as a
+# thumbnail (Qt, lazily imported so the module stays importable without a UI)
+# --------------------------------------------------------------------------- #
+
+PALETTE_THUMB_SIZE = (168, 26)
+_PALETTE_PICKERS = {}   # node session id -> picker window
+_PalettePicker = None
+
+
+def _qt_modules():
+    """(QtCore, QtGui, QtWidgets) of the Qt binding shipped with this Houdini."""
+    try:
+        from PySide2 import QtCore, QtGui, QtWidgets
+    except ImportError:
+        from PySide6 import QtCore, QtGui, QtWidgets
+    return QtCore, QtGui, QtWidgets
+
+
+def palette_thumbnail(strip, size=PALETTE_THUMB_SIZE):
+    """A QPixmap of one palette strip (bytes from read_clut_strips)."""
+    QtCore, QtGui, _ = _qt_modules()
+    image = QtGui.QImage(strip, CLUT_STRIP_WIDTH, 1, CLUT_STRIP_WIDTH * 3,
+                         QtGui.QImage.Format_RGB888)
+    scaled = image.scaled(size[0], size[1], QtCore.Qt.IgnoreAspectRatio,
+                          QtCore.Qt.SmoothTransformation)
+    return QtGui.QPixmap.fromImage(scaled)
+
+
+def _node_palette_state(node):
+    """(library, index, reverse, clut path) currently set on a SuperColor node."""
+    library_parm = node.parm(EROSION_PARM_PREFIX + "Library")
+    index_parm = node.parm(EROSION_PARM_PREFIX + "LibraryItem")
+    reverse_parm = node.parm(EROSION_PARM_PREFIX + "Reverse")
+    library = library_parm.evalAsString() if library_parm is not None else "Rock"
+    index = int(index_parm.eval()) if index_parm is not None else 0
+    reverse = bool(reverse_parm.eval()) if reverse_parm is not None else False
+    config = BridgeConfig.load(overrides=overrides_from_node(node))
+    apply_shared_paths(config)
+    return library, index, reverse, clut_path(config.gaea_exe, library)
+
+
+def _palette_picker_class():
+    """The picker window class, created on first use (needs Qt)."""
+    global _PalettePicker
+    if _PalettePicker is not None:
+        return _PalettePicker
+    QtCore, QtGui, QtWidgets = _qt_modules()
+
+    class PalettePicker(QtWidgets.QDialog):
+        """Thumbnails of every palette in the chosen Library; a click sets
+        Library + Palette on the bridge node (and Auto Build runs if on)."""
+
+        def __init__(self, node, parent=None):
+            super(PalettePicker, self).__init__(parent)
+            self._node_id = node.sessionId()
+            self._loaded = None   # (clut path, reverse) shown in the list
+            self._updating = False
+            self.setWindowTitle("Gaea Palettes: {}".format(node.name()))
+            self.setWindowFlags(QtCore.Qt.Tool | QtCore.Qt.WindowCloseButtonHint |
+                                QtCore.Qt.WindowMinMaxButtonsHint)
+            self.resize(4 * (PALETTE_THUMB_SIZE[0] + 24) + 52, 560)
+
+            self.library = QtWidgets.QComboBox()
+            self.library.addItems(list(SUPERCOLOR_LIBRARY))
+            self.reverse = QtWidgets.QCheckBox("Reverse")
+            self.info = QtWidgets.QLabel()
+            self.info.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+            top = QtWidgets.QHBoxLayout()
+            top.addWidget(QtWidgets.QLabel("Library"))
+            top.addWidget(self.library)
+            top.addSpacing(12)
+            top.addWidget(self.reverse)
+            top.addStretch(1)
+            top.addWidget(self.info)
+
+            self.list = QtWidgets.QListWidget()
+            self.list.setViewMode(QtWidgets.QListView.IconMode)
+            self.list.setResizeMode(QtWidgets.QListView.Adjust)
+            self.list.setMovement(QtWidgets.QListView.Static)
+            self.list.setWrapping(True)
+            self.list.setUniformItemSizes(True)
+            self.list.setSpacing(5)
+            self.list.setIconSize(QtCore.QSize(*PALETTE_THUMB_SIZE))
+            self.list.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+            self.list.setVerticalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
+            # Frame the whole thumbnail of the chosen palette, not just its number.
+            self.list.setStyleSheet(
+                "QListWidget::item { padding: 3px; border: 2px solid transparent; }"
+                "QListWidget::item:selected { border: 2px solid palette(highlight);"
+                " background: transparent; }"
+                "QListWidget::item:hover { border: 2px solid palette(mid); }")
+
+            close = QtWidgets.QPushButton("Close")
+            close.clicked.connect(self.close)
+            bottom = QtWidgets.QHBoxLayout()
+            bottom.addWidget(QtWidgets.QLabel(
+                "Click a palette to use it; double-click also closes the window."))
+            bottom.addStretch(1)
+            bottom.addWidget(close)
+
+            layout = QtWidgets.QVBoxLayout(self)
+            layout.addLayout(top)
+            layout.addWidget(self.list, 1)
+            layout.addLayout(bottom)
+
+            self.library.currentTextChanged.connect(self._on_library)
+            self.reverse.toggled.connect(self._on_reverse)
+            self.list.currentItemChanged.connect(self._on_current_item)
+            self.list.itemClicked.connect(self._on_item)
+            self.list.itemDoubleClicked.connect(lambda item: self.close())
+            self.refresh()
+
+        # -- node access -------------------------------------------------- #
+        def node(self):
+            import hou
+            node = hou.nodeBySessionId(self._node_id)
+            if node is None:
+                self.close()
+            return node
+
+        def refresh(self):
+            """Mirror the node's Library / Palette / Reverse; reload the
+            thumbnails when the library (file) or Reverse changed."""
+            node = self.node()
+            if node is None:
+                return
+            library, index, reverse, path = _node_palette_state(node)
+            self._updating = True
+            try:
+                if self.library.currentText() != library:
+                    self.library.setCurrentText(library)
+                self.reverse.setChecked(reverse)
+                if self._loaded != (path, reverse):
+                    self._fill(path, reverse, library)
+                self._select(index)
+            finally:
+                self._updating = False
+
+        def _fill(self, path, reverse, library):
+            self.list.clear()
+            strips = read_clut_strips(path, reverse=reverse) if path else []
+            for i, strip in enumerate(strips):
+                item = QtWidgets.QListWidgetItem(QtGui.QIcon(palette_thumbnail(strip)),
+                                                 str(i))
+                item.setToolTip("{} {}".format(library, i))
+                item.setData(QtCore.Qt.UserRole, i)
+                self.list.addItem(item)
+            self._loaded = (path, reverse)
+            if strips:
+                self.info.setText("{} palettes".format(len(strips)))
+            else:
+                self.info.setText("{}.clut not found: set Gaea Exe (Paths tab)".format(
+                    library))
+
+        def _select(self, index):
+            if 0 <= index < self.list.count():
+                item = self.list.item(index)
+                self.list.setCurrentItem(item)
+                self.list.scrollToItem(item,
+                                       QtWidgets.QAbstractItemView.PositionAtCenter)
+            else:
+                self.list.setCurrentItem(None)
+
+        def current_values(self):
+            item = self.list.currentItem()
+            index = item.data(QtCore.Qt.UserRole) if item is not None else None
+            return self.library.currentText(), index, self.reverse.isChecked()
+
+        # -- picker -> node ----------------------------------------------- #
+        def _apply(self, library=None, index=None, reverse=None):
+            import hou
+
+            if self._updating:
+                return
+            node = self.node()
+            if node is None:
+                return
+            changed = False
+            with hou.undos.group("Gaea Bridge: choose palette"):
+                for name, value in (("Library", library), ("LibraryItem", index),
+                                    ("Reverse", reverse)):
+                    parm = node.parm(EROSION_PARM_PREFIX + name)
+                    if parm is None or value is None:
+                        continue
+                    current = parm.evalAsString() if name == "Library" else parm.eval()
+                    if name == "Reverse":
+                        value, current = int(bool(value)), int(bool(current))
+                    if current != value:
+                        parm.set(value)
+                        changed = True
+            if changed:
+                on_supercolor_parm_changed(node)
+
+        def _on_library(self, library):
+            if self._updating:
+                return
+            node = self.node()
+            if node is None:
+                return
+            config = BridgeConfig.load(overrides=overrides_from_node(node))
+            apply_shared_paths(config)
+            path = clut_path(config.gaea_exe, library)
+            _, index, reverse, _ = _node_palette_state(node)
+            count = clut_count(path)
+            if count:
+                index = min(index, count - 1)
+            self._apply(library=library, index=index)
+            self.refresh()
+
+        def _on_reverse(self, checked):
+            if self._updating:
+                return
+            self._apply(reverse=checked)
+            self.refresh()
+
+        def _on_current_item(self, item, _previous=None):
+            self._on_item(item)
+
+        def _on_item(self, item):
+            if item is None or self._updating:
+                return
+            self._apply(index=item.data(QtCore.Qt.UserRole))
+
+    _PalettePicker = PalettePicker
+    return PalettePicker
+
+
+def choose_palette(node):
+    """Button "Choose Palette..." of the SuperColor bridge: open (or bring back)
+    the palette picker window of this node. Returns the window."""
+    key = node.sessionId()
+    picker = _PALETTE_PICKERS.get(key)
+    if picker is not None:
+        try:
+            picker.refresh()
+            picker.show()
+            picker.raise_()
+            picker.activateWindow()
+            return picker
+        except RuntimeError:   # the Qt window was already destroyed
+            _PALETTE_PICKERS.pop(key, None)
+    parent = None
+    try:
+        import hou
+        parent = hou.qt.mainWindow()
+    except Exception:
+        parent = None
+    picker = _palette_picker_class()(node, parent)
+    _PALETTE_PICKERS[key] = picker
+    picker.show()
+    picker.raise_()
+    picker.activateWindow()
+    return picker
+
+
+def _sync_palette_picker(node):
+    """Keep an open picker in step with values changed on the node itself."""
+    picker = _PALETTE_PICKERS.get(node.sessionId())
+    if picker is None:
+        return
+    try:
+        if picker.isVisible() and not picker._updating:
+            picker.refresh()
+    except RuntimeError:
+        _PALETTE_PICKERS.pop(node.sessionId(), None)
 
 
 def on_template_toggled(node):
@@ -2239,7 +2721,7 @@ def export_from_node(node, use_cache=True):
     """Export the HDA node's first input (terrain) and second input (mask)."""
     source = node_input(node, 0)
     if source is None:
-        raise RuntimeError("Connect a HeightField into the Gaea Erosion2 Bridge input.")
+        raise RuntimeError("Connect a HeightField into the Gaea bridge node's input.")
     return export_for_gaea(source, config_from_node(node), use_cache=use_cache,
                            mask_node=node_input(node, 1))
 
@@ -2277,46 +2759,51 @@ def import_into_node(node, config=None, set_display=True):
 
     if node.parm("_imported") is None:
         raise RuntimeError(
-            "{} is not an up-to-date Gaea Erosion2 Bridge node. Rebuild the HDA "
+            "{} is not an up-to-date Gaea bridge node. Rebuild the HDAs "
             "(build_gaea_bridge_hda.py).".format(node.path())
         )
     config = config or config_from_node(node)
     manifest = read_manifest(config) or {}
     encoding = manifest.get("height_encoding") or {}
 
-    layers = ("height",) + MASK_LAYERS
-    found = {
-        layer: find_output_file(config, layer) if layer in config.output_maps else None
-        for layer in layers
-    }
+    # Erosion bridges: height + masks; color bridges: their color map(s).
+    layers = tuple(config.output_maps)
+    found = {layer: find_output_file(config, layer) for layer in layers}
     if not any(found.values()):
         raise RuntimeError(
             "No Gaea output maps were found in {}. Build the project in Gaea "
             "(F8) first, then import.".format(config.output_dir)
         )
     stamp = output_stamp(config)
+    tint = None
 
-    with hou.undos.group("Gaea Erosion2 Bridge: import"):
+    with hou.undos.group("Gaea Bridge: import"):
         _set_parm_if_present(node, "_import_stamp", stamp)
         for layer in layers:
-            node.parm("_{}_file".format(layer)).set(found[layer] or "")
+            path = found[layer] or ""
+            if layer in COLOR_LAYERS and path:
+                # Shown as a texture: a per-build file name, so the viewport
+                # loads the new map instead of the one cached for the old path.
+                path = display_path(config, path, layer + "_")
+            _set_parm_if_present(node, "_{}_file".format(layer), path)
         for layer in MASK_LAYERS:
-            node.parm("_{}_peak".format(layer)).set(0.0)
-        node.parm("_enc_span").set(float(encoding.get("span", 0.0)))
-        node.parm("_enc_offset").set(float(encoding.get("offset", 0.0)))
-        node.parm("_houdini_width").set(float(manifest.get("houdini_width") or 0.0))
-        tint = find_tint_file(config)
-        # A per-build file name, so the viewport loads the new map by itself.
-        _set_parm_if_present(node, "_tint_file",
-                             tint_display_path(config, tint) if tint else "")
-        if not tint:
-            _set_parm_if_present(node, "show_tint", 0)
+            _set_parm_if_present(node, "_{}_peak".format(layer), 0.0)
+        _set_parm_if_present(node, "_enc_span", float(encoding.get("span", 0.0)))
+        _set_parm_if_present(node, "_enc_offset", float(encoding.get("offset", 0.0)))
+        _set_parm_if_present(node, "_houdini_width",
+                             float(manifest.get("houdini_width") or 0.0))
+        if node.parm("_tint_file") is not None:
+            tint = find_tint_file(config)
+            # A per-build file name, so the viewport loads the new map by itself.
+            _set_parm_if_present(node, "_tint_file",
+                                 tint_display_path(config, tint) if tint else "")
+            if not tint:
+                _set_parm_if_present(node, "show_tint", 0)
         node.parm("_imported").set(1)
 
         # Same path as last time -> make the file nodes re-read the new build.
-        for layer in layers:
-            child = node.node("file_" + layer)
-            if child is not None and found[layer] and child.parm("reload") is not None:
+        for child in node.children():
+            if child.name().startswith("file_") and child.parm("reload") is not None:
                 child.parm("reload").pressButton()
 
         # Peaks of the raw Gaea values drive Normalize. Read them from each file
@@ -2324,7 +2811,7 @@ def import_into_node(node, config=None, set_display=True):
         peaks = {}
         for layer in MASK_LAYERS:
             child = node.node("file_" + layer)
-            if found[layer] and child is not None:
+            if found.get(layer) and child is not None:
                 child.cook(force=True)
                 peaks.update(_layer_peaks(child, [layer]))
         for layer, peak in peaks.items():
@@ -2341,6 +2828,9 @@ def import_into_node(node, config=None, set_display=True):
     message = import_message(
         imported, skipped, peaks, "", bool(encoding.get("span"))
     )
+    if any(layer in COLOR_LAYERS for layer in imported):
+        message += ("  Color map on output 1 (mesh; Color tab: Texture or Point "
+                    "Color) and as color_r / color_g / color_b layers on output 2.")
     if tint:
         message += "  Tint map loaded (Tint tab > Show / Hide Tint)."
     if removed:
@@ -2359,8 +2849,8 @@ def clear_node_import(node):
         stop_auto_import(node)
     node.parm("_imported").set(0)
     _set_parm_if_present(node, "_import_stamp", "")
-    for layer in ("height",) + MASK_LAYERS:
-        node.parm("_{}_file".format(layer)).set("")
+    for layer in ("height",) + MASK_LAYERS + COLOR_LAYERS:
+        _set_parm_if_present(node, "_{}_file".format(layer), "")
     _set_parm_if_present(node, "_tint_file", "")
     _set_parm_if_present(node, "show_tint", 0)
 
@@ -2524,7 +3014,7 @@ def is_building(node):
     return entry is not None and entry["job"].poll() is None
 
 
-STATUS_PARMS = ("_status", "_status_erosion", "_status_tint")  # per tab
+STATUS_PARMS = ("_status", "_status_erosion", "_status_tint", "_status_color")  # per tab
 
 
 def set_status(node, message):
