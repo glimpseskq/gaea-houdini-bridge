@@ -32,11 +32,17 @@ Outputs 2-4 have the same layout as output 1 (height + mask), so each plugs
 straight into the Mask input of HeightField nodes.
 """
 
+import importlib
 import os
 
 import hou
 
 import houdini_gaea_bridge as ghb
+
+# Rebuilding the HDAs after an update must also bring in the updated module:
+# Python keeps the version imported earlier in this Houdini session, and the
+# new buttons would call functions it doesn't have yet.
+ghb = importlib.reload(ghb)
 
 
 # One HDA per Gaea erosion node. The Erosion2 type name stays "gaea_erosion_bridge"
@@ -54,12 +60,32 @@ ASSETS = {
     "SuperColor": {"type_name": "gaea_supercolor_bridge",
                    "label": "Gaea SuperColor Bridge", "node_name": None,
                    "profile": "color"},
+    # Talus erosion: same as the erosion bridges, but only Wear and Deposits
+    # (no Flow), so three outputs: Terrain, Wear, Sediment.
+    "Thermal2": {"type_name": "gaea_thermal2_bridge", "label": "Gaea Thermal2 Bridge",
+                 "node_name": None, "profile": "erosion"},
 }
 ASSET_TYPE_NAME = ASSETS["Erosion2"]["type_name"]
 ASSET_LABEL = ASSETS["Erosion2"]["label"]
 NODE_NAME = ASSETS["Erosion2"]["node_name"]
 
-MASK_LAYERS = ("flow", "wear", "sediment")
+MASK_LAYERS = ("flow", "wear", "sediment")  # every mask any erosion bridge can have
+
+# Gaea's name of each mask output and what it shows, for labels and help.
+MASK_INFO = {
+    "flow": ("Flow", "Flow", "Where water runs: thin channel networks."),
+    "wear": ("Wear", "Wear", "Where material was eroded away."),
+    "sediment": ("Sediment", "Deposits", "Where eroded material was deposited."),
+}
+
+# The node tab is called "Erosion" on the two hydraulic erosion bridges (their
+# parameter names predate the other kinds), else after the Gaea node.
+EROSION_TAB_KINDS = ("Erosion2", "Erosion")
+
+
+def _mask_layers(node_kind):
+    """Mask layers of an erosion-profile bridge (Thermal2: wear, sediment)."""
+    return ghb.mask_layers_for_kind(node_kind)
 
 
 # The callback snippets stored on the buttons. Button callbacks run in their own
@@ -212,17 +238,18 @@ def _has_layer_expr(layer):
     return 'strlen(chs("../_{0}_file")) > 0'.format(layer)
 
 
-# Mask layers are dropped from every output once the wanted one is in "mask".
+# Mask layers are dropped from every output once the wanted one is in "mask"
+# (all names: a group naming a layer a bridge doesn't have matches nothing).
 EXTRA_LAYERS_GROUP = " ".join("@name=" + layer for layer in MASK_LAYERS)
 
 
 HEIGHT_FROM_GAEA_EXPR = 'strlen(chs("../_height_file")) > 0 && ch("../height_source") == 0'
 
 
-def _process_vex():
+def _process_vex(layers=MASK_LAYERS):
     """Per-voxel processing of the imported layers (runs in a Volume Wrangle)."""
     lines = [
-        "// Gaea Erosion2 Bridge: driven by the asset's parameters.",
+        "// Gaea bridge: driven by the asset's parameters.",
         "",
         "// Height: Gaea 0..1 -> Houdini units, only when the height comes from Gaea.",
         'if (chi("../height_source") == 0 && strlen(chs("../_height_file")) > 0'
@@ -243,15 +270,15 @@ def _process_vex():
         '    f@{0} = v * chf("../{0}_strength");',
         "}}",
     ])
-    for layer in MASK_LAYERS:
+    for layer in layers:
         lines.append(block.format(layer))
     return "\n".join(lines) + "\n"
 
 
-def _show_mask_vex():
+def _show_mask_vex(layers=MASK_LAYERS):
     """Terrain output preview: the mask chosen in Show Mask goes into "mask"."""
     lines = ['string sel = chs("../view_mask");']
-    for layer in MASK_LAYERS:
+    for layer in layers:
         lines.append('if (sel == "{0}") f@mask = f@{0};'.format(layer))
     return "\n".join(lines) + "\n"
 
@@ -319,14 +346,15 @@ def _switch(parent, name, inputs, index_expr):
     return node
 
 
-def _build_network(subnet):
+def _build_network(subnet, layers=MASK_LAYERS):
+    """Erosion profile: height + one output per mask in ``layers``."""
     source = subnet.indirectInputs()[0]
 
     gaea_height = _file_node(subnet, "file_height", None, "heightfield", "height")
     prev = _switch(subnet, "height_source_switch", (source, gaea_height),
                    HEIGHT_FROM_GAEA_EXPR)
 
-    for layer in MASK_LAYERS:
+    for layer in layers:
         file_node = _file_node(subnet, "file_" + layer, prev, "mask", layer)
         prev = _switch(subnet, "use_" + layer, (prev, file_node),
                        _has_layer_expr(layer))
@@ -336,10 +364,10 @@ def _build_network(subnet):
 
     process = subnet.createNode("volumewrangle", "process_layers")
     process.setInput(0, raw)
-    _setp(process, "snippet", _process_vex())
+    _setp(process, "snippet", _process_vex(layers))
     prev = process
 
-    for layer in MASK_LAYERS:
+    for layer in layers:
         blur = subnet.createNode("heightfield_blur", "blur_" + layer)
         blur.setInput(0, prev)
         _setp(blur, ("layer", "blurlayer"), layer)
@@ -360,9 +388,9 @@ def _build_network(subnet):
 
     # Output 1 - Terrain: height; "mask" shows the Show Mask choice (None = the
     # input's own mask, empty for a Gaea result).
-    branches = [("TERRAIN", mask_branch("terrain", _show_mask_vex()))]
-    # Outputs 2-4 - one per Gaea mask, as "mask" on the same height.
-    for layer in MASK_LAYERS:
+    branches = [("TERRAIN", mask_branch("terrain", _show_mask_vex(layers)))]
+    # Outputs 2.. - one per Gaea mask, as "mask" on the same height.
+    for layer in layers:
         branches.append((layer.upper(), mask_branch(
             layer, "f@mask = f@{};\n".format(layer))))
 
@@ -620,11 +648,10 @@ def _status_parm(name):
 
 def _erosion_tab(node_kind):
     """Parameters of the project's Gaea node (``node_kind``: "Erosion2",
-    "Erosion" or "SuperColor"), shown in template mode. The parameter names stay
-    the erosion ones (use_template, ero_*) for every kind."""
-    is_erosion = ASSETS[node_kind]["profile"] == "erosion"
-    tab = hou.FolderParmTemplate("erosion_tab", "Erosion" if is_erosion else node_kind,
-                                 folder_type=hou.folderType.Tabs)
+    "Erosion", "SuperColor" or "Thermal2"), shown in template mode. The
+    parameter names stay the erosion ones (use_template, ero_*) for every kind."""
+    title = "Erosion" if node_kind in EROSION_TAB_KINDS else node_kind
+    tab = hou.FolderParmTemplate("erosion_tab", title, folder_type=hou.folderType.Tabs)
     # Same actions and status as on the Bridge tab, so the loop "tweak -> rebuild"
     # never leaves this tab.
     for template in _action_row("_erosion"):
@@ -634,9 +661,9 @@ def _erosion_tab(node_kind):
         help="Run Build automatically whenever a {} value changes (once you stop "
              "changing it). While it runs, the whole node is locked until the result "
              "is imported; Cancel unlocks it. Needs Use {} Template.".format(
-                 node_kind, "Erosion" if is_erosion else node_kind)))
+                 node_kind, title)))
     tab.addParmTemplate(hou.ToggleParmTemplate(
-        "use_template", "Use {} Template".format("Erosion" if is_erosion else node_kind),
+        "use_template", "Use {} Template".format(title),
         default_value=False, script_callback=TEMPLATE_CALLBACK,
         script_callback_language=hou.scriptLanguage.Python,
         help="The Gaea Project is a template whose {0} node feeds the Export "
@@ -646,7 +673,7 @@ def _erosion_tab(node_kind):
     hidden = "{ use_template == 0 }"
 
     node_name = hou.StringParmTemplate(
-        "erosion_node", "{} Node".format("Erosion" if is_erosion else node_kind), 1,
+        "erosion_node", "{} Node".format(title), 1,
         default_value=("",),
         help="Name of the {0} node to drive. Empty = the only {0} in the "
              "project.".format(node_kind))
@@ -856,7 +883,7 @@ def _build_parm_template_group(node_kind="Erosion2"):
         g.append(_color_tab())
     else:
         g.append(_tint_tab())
-        g.append(_layers_tab())
+        g.append(_layers_tab(node_kind))
 
     g.append(_paths_tab(node_kind))
 
@@ -884,10 +911,10 @@ def _build_parm_template_group(node_kind="Erosion2"):
         # Tint display state, set only by Show / Hide Tint.
         g.append(_hidden(hou.ToggleParmTemplate("show_tint", "Tint shown",
                                                 default_value=False)))
-        for layer in ("height",) + MASK_LAYERS:
+        for layer in ("height",) + _mask_layers(node_kind):
             g.append(_hidden(hou.StringParmTemplate(
                 "_{}_file".format(layer), layer + " file", 1, default_value=("",))))
-        for layer in MASK_LAYERS:
+        for layer in _mask_layers(node_kind):
             g.append(_hidden(hou.FloatParmTemplate(
                 "_{}_peak".format(layer), layer + " peak", 1, default_value=(0.0,))))
         for name in ("_enc_span", "_enc_offset"):
@@ -896,7 +923,9 @@ def _build_parm_template_group(node_kind="Erosion2"):
     return hou.ParmTemplateGroup([_with_lock(t) for t in g.entries()])
 
 
-def _layers_tab():
+def _layers_tab(node_kind="Erosion2"):
+    masks = _mask_layers(node_kind)
+    labels = tuple(MASK_INFO[layer][0] for layer in masks)
     layers = hou.FolderParmTemplate("layers_tab", "Gaea Layers",
                                     folder_type=hou.folderType.Tabs)
     layers.addParmTemplate(hou.MenuParmTemplate(
@@ -910,19 +939,16 @@ def _layers_tab():
              "Layer, Replace), so it keeps the input's voxel size and resolution. "
              "Off: outputs keep the resolution Gaea built at."))
     layers.addParmTemplate(hou.MenuParmTemplate(
-        "view_mask", "Show Mask", ("none",) + MASK_LAYERS,
-        menu_labels=("None", "Flow", "Wear", "Sediment"), default_value=0,
+        "view_mask", "Show Mask", ("none",) + masks,
+        menu_labels=("None",) + labels, default_value=0,
         help="Preview on the Terrain output: put this mask into its 'mask' layer so "
              "it shows in red on the terrain. Set back to None before using the "
              "Terrain output downstream, or HeightField nodes will use that mask. "
-             "Each mask always has its own output (Flow, Wear, Sediment)."))
-    layers.addParmTemplate(_mask_folder(
-        "flow", "Flow", "Where water runs: thin channel networks (Erosion2 Flow)."))
-    layers.addParmTemplate(_mask_folder(
-        "wear", "Wear", "Where material was eroded away (Erosion2 Wear)."))
-    layers.addParmTemplate(_mask_folder(
-        "sediment", "Sediment", "Where eroded material was deposited "
-        "(Erosion2 Deposits)."))
+             "Each mask always has its own output ({}).".format(", ".join(labels))))
+    for layer in masks:
+        label, gaea_port, what = MASK_INFO[layer]
+        layers.addParmTemplate(_mask_folder(
+            layer, label, "{} ({} {}).".format(what.rstrip("."), node_kind, gaea_port)))
     return layers
 
 
@@ -1009,7 +1035,7 @@ def build(install_dir=None, node_kind="Erosion2"):
         if color:
             _build_color_network(subnet)
         else:
-            _build_network(subnet)
+            _build_network(subnet, _mask_layers(node_kind))
 
         if install_dir is None:
             install_dir = os.path.join(
@@ -1033,7 +1059,7 @@ def build(install_dir=None, node_kind="Erosion2"):
             outputs = ("Colored Mesh", "HeightField + color_r/g/b")
         else:
             inputs = ("HeightField", "Mask (optional)")
-            outputs = ("Terrain",) + tuple(l.capitalize() for l in MASK_LAYERS)
+            outputs = ("Terrain",) + tuple(MASK_INFO[l][0] for l in _mask_layers(node_kind))
         definition.setMaxNumOutputs(len(outputs))
         _set_io_labels(definition, inputs=inputs, outputs=outputs)
         scripts = [("OnLoaded", ON_LOADED_SCRIPT), ("OnDeleted", ON_DELETED_SCRIPT)]
@@ -1059,8 +1085,8 @@ def build(install_dir=None, node_kind="Erosion2"):
 
 
 def build_all(install_dir=None):
-    """Install every bridge: Gaea Erosion2 Bridge, Gaea Erosion Bridge and Gaea
-    SuperColor Bridge."""
+    """Install every bridge: Gaea Erosion2 Bridge, Gaea Erosion Bridge, Gaea
+    SuperColor Bridge and Gaea Thermal2 Bridge."""
     return [build(install_dir, node_kind) for node_kind in ASSETS]
 
 

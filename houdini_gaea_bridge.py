@@ -70,8 +70,11 @@ DEFAULT_TINT_OUTPUT = "output_tint_combine.exr"
 # color_r / color_g / color_b HeightField layers; never a height.
 COLOR_OUTPUT_MAPS = {"supercolor": "output_supercolor.exr"}
 COLOR_LAYERS = tuple(COLOR_OUTPUT_MAPS)
+# Thermal2 (talus erosion) has no Flow: Out, Wear and Deposits only.
+THERMAL_OUTPUT_MAPS = {layer: DEFAULT_OUTPUT_MAPS[layer]
+                       for layer in ("height", "wear", "sediment")}
 # Node kind -> the Export nodes its bridge expects (other kinds: DEFAULT_OUTPUT_MAPS).
-KIND_OUTPUT_MAPS = {"SuperColor": COLOR_OUTPUT_MAPS}
+KIND_OUTPUT_MAPS = {"SuperColor": COLOR_OUTPUT_MAPS, "Thermal2": THERMAL_OUTPUT_MAPS}
 
 # Mask layers (everything but height) are normalized to 0..1 on import, and one of
 # them can be copied into the "mask" layer, which Houdini draws in the viewport and
@@ -216,6 +219,14 @@ class BridgeConfig:
 def output_maps_for_kind(kind):
     """The output maps a bridge for Gaea node ``kind`` imports."""
     return dict(KIND_OUTPUT_MAPS.get(kind, DEFAULT_OUTPUT_MAPS))
+
+
+def mask_layers_for_kind(kind):
+    """The mask layers (outputs besides height) of an erosion-type bridge, in
+    MASK_LAYERS order: flow, wear, sediment for Erosion2 / Erosion; wear,
+    sediment for Thermal2."""
+    maps = output_maps_for_kind(kind)
+    return tuple(layer for layer in MASK_LAYERS if layer in maps)
 
 
 def primary_output(output_maps):
@@ -676,12 +687,14 @@ def _collect_nodes(data, kind, found):
     return found
 
 
-MASK_PORT_NAMES = ("mask", "texture")  # Erosion2 / Erosion "Mask", SuperColor "Texture"
+# Erosion2 / Erosion "Mask", SuperColor "Texture", Thermal2 "AreaMask".
+MASK_PORT_NAMES = ("mask", "texture", "areamask")
 
 
 def mask_file_nodes(data):
-    """File nodes of a .terrain that feed a port named "Mask" (e.g. Erosion2's)
-    or "Texture" (SuperColor's): they read the bridge's mask input."""
+    """File nodes of a .terrain that feed a port named "Mask" (e.g. Erosion2's),
+    "Texture" (SuperColor's) or "AreaMask" (Thermal2's): they read the bridge's
+    mask input."""
     sources = set()
 
     def walk(value):
@@ -976,6 +989,18 @@ EROSION1_PARAMS = (
     ("Deterministic", "Deterministic", "Other Settings", "bool", False, 0, 1),
 )
 
+# Thermal2 (QuadSpinner.Gaea.Nodes.Thermal2, Gaea 2.3): talus (thermal) erosion.
+# Outputs Out, Wear, Deposits; mask port AreaMask. The SedimentRemoval input port
+# is left to the project.
+THERMAL2_PARAMS = (
+    ("Duration", "Duration", "Erosion", "float", 0.04, 0.0001, 1.0),
+    ("Strength", "Strength", "Erosion", "float", 0.25, 0.0001, 1.0),
+    ("Anisotropy", "Anisotropy", "Erosion", "float", 0.25, 0.0, 1.0),
+    ("Angle", "Angle", "Talus", "float", 32.0, 0.0, 90.0),
+    ("SedimentRemoval", "Sediment Removal", "Talus", "float", 0.0, 0.0, 1.0),
+    ("FeatureScale", "Feature Scale", "Scale", "float", 25.0, 1.0, 300.0),
+)
+
 # SuperColor (QuadSpinner.Gaea.Nodes.SuperColor, Gaea 2.3): a color map from a
 # palette of Gaea's CLUT library. Range is a Float2 ("float2": default (x, y),
 # min, max per component; stored as {"X": .., "Y": ..}). The palette itself is
@@ -1001,7 +1026,7 @@ SUPERCOLOR_PARAMS = (
 
 # Gaea node kind (type name) -> its parameter spec: one bridge HDA per kind.
 EROSION_SPECS = {"Erosion2": EROSION2_PARAMS, "Erosion": EROSION1_PARAMS,
-                 "SuperColor": SUPERCOLOR_PARAMS}
+                 "SuperColor": SUPERCOLOR_PARAMS, "Thermal2": THERMAL2_PARAMS}
 
 
 def erosion_spec(kind):

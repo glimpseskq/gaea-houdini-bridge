@@ -18,6 +18,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import houdini_gaea_bridge as ghb  # noqa: E402
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+
 
 def _write(path, data=b"data"):
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -487,6 +489,98 @@ class Erosion1TemplateTests(unittest.TestCase):
         first = ghb.build_settings(self.cfg)
         self.cfg.erosion_kind = "Erosion2"
         self.assertNotEqual(first, ghb.build_settings(self.cfg))
+
+
+class Thermal2Tests(unittest.TestCase):
+    """Gaea Thermal2 Bridge: height + Wear + Deposits (no Flow), AreaMask port."""
+
+    SAMPLE = os.path.join(HERE, "..", "GaeaTerrain", "thermal2.terrain")
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.cfg = ghb.BridgeConfig(bridge_dir=os.path.join(self.tmp, "bridge"),
+                                    gaea_project=os.path.join(self.tmp, "t2.terrain"),
+                                    erosion_kind="Thermal2", use_template=True,
+                                    output_maps=ghb.output_maps_for_kind("Thermal2"))
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _project(self, mask=True, **values):
+        nodes = {
+            "1": {"$type": "QuadSpinner.Gaea.Nodes.File, Gaea.Nodes", "Id": 1,
+                  "FileName": "D:\\x\\input_height.exr"},
+            "2": {"$type": "QuadSpinner.Gaea.Nodes.File, Gaea.Nodes", "Id": 2,
+                  "FileName": ""},
+            "3": dict({"$type": "QuadSpinner.Gaea.Nodes.Thermal2, Gaea.Nodes", "Id": 3,
+                       "Name": "Thermal2", "Ports": {"$values": [
+                           {"Name": "In", "Record": {"From": 1, "ToPort": "In"}}] + (
+                           [{"Name": "AreaMask",
+                             "Record": {"From": 2, "ToPort": "AreaMask"}}]
+                           if mask else [])}}, **values),
+        }
+        for i, name in enumerate(("output_height", "output_wear", "output_sediment"), 4):
+            nodes[str(i)] = {"$type": "QuadSpinner.Gaea.Nodes.Export, Gaea.Nodes",
+                             "Id": i, "Name": name}
+        with open(self.cfg.gaea_project, "w", encoding="utf-8") as handle:
+            json.dump({"Assets": {"$values": [{"Terrain": {"Nodes": nodes}}]}}, handle)
+
+    def test_spec_matches_gaea(self):
+        names = [spec[0] for spec in ghb.THERMAL2_PARAMS]
+        self.assertEqual(names, ["Duration", "Strength", "Anisotropy", "Angle",
+                                 "SedimentRemoval", "FeatureScale"])
+        for name, _, _, kind, default, low, high in ghb.THERMAL2_PARAMS:
+            self.assertEqual(kind, "float", name)
+            self.assertTrue(low <= default <= high, name)
+        self.assertIs(ghb.erosion_spec("Thermal2"), ghb.THERMAL2_PARAMS)
+
+    def test_outputs_masks_and_project(self):
+        self.assertEqual(ghb.output_maps_for_kind("Thermal2"), {
+            "height": "output_height.exr", "wear": "output_wear.exr",
+            "sediment": "output_sediment.exr"})
+        self.assertEqual(ghb.mask_layers_for_kind("Thermal2"), ("wear", "sediment"))
+        self.assertEqual(ghb.mask_layers_for_kind("Erosion2"), ghb.MASK_LAYERS)
+        self.assertEqual(self.cfg.primary_output, "height")
+        self.assertEqual(ghb.project_name_for_kind("Thermal2"), "thermal2.terrain")
+        self._project()
+        self.assertEqual(ghb.find_project_for_kind(self.tmp, "Thermal2"),
+                         self.cfg.gaea_project)
+        # An Erosion2 bridge never picks a Thermal2 project.
+        self.assertIsNone(ghb.find_project_for_kind(self.tmp, "Erosion2"))
+
+    def test_copy_writes_values_and_area_mask(self):
+        self._project(Strength=0.45)
+        self.assertEqual(ghb.check_project_paths(self.cfg, fix_mask_paths=True), [])
+        self.cfg.erosion_params = {"Strength": 0.45, "Angle": 40.0, "FeatureScale": 25.0}
+        dst = ghb.template_build_path(self.cfg)
+        changed = ghb.write_template_copy(self.cfg, dst)
+        self.assertIn("Angle", changed)
+        self.assertIn("mask file", changed)
+        with open(dst, encoding="utf-8") as handle:
+            data = json.load(handle)
+        node = ghb.find_erosion_node(data, kind="Thermal2")
+        self.assertEqual(node["Angle"], 40.0)
+        self.assertNotIn("FeatureScale", node)  # Gaea default: not written
+        mask = ghb.mask_file_nodes(data)
+        self.assertEqual(len(mask), 1)
+        self.assertTrue(ghb._same_path(mask[0]["FileName"], self.cfg.mask_input_path))
+
+    @unittest.skipUnless(os.path.isfile(SAMPLE), "sample project not present")
+    def test_sample_project(self):
+        values = ghb.read_erosion_params(self.SAMPLE, kind="Thermal2")
+        self.assertAlmostEqual(values["Strength"], 0.45507553, places=6)
+        self.assertEqual(values["Angle"], 32.0)  # not saved: Gaea default
+        cfg = ghb.BridgeConfig(bridge_dir=self.cfg.bridge_dir, gaea_project=self.SAMPLE,
+                               erosion_kind="Thermal2", use_template=True,
+                               erosion_params={"Angle": 40.0},
+                               output_maps=ghb.output_maps_for_kind("Thermal2"))
+        # The build copy points the File and all three Exports at the bridge.
+        copy = ghb.template_build_path(cfg)
+        changed = ghb.write_template_copy(cfg, copy)
+        self.assertEqual(changed, ["Angle", "input file", "export paths"])
+        cfg.gaea_project = copy
+        self.assertEqual(ghb.check_project_paths(cfg), [])
 
 
 class SuperColorTests(unittest.TestCase):
