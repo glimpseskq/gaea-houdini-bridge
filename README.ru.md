@@ -13,7 +13,8 @@ HeightField ─▶ input_height.exr ─▶ Gaea: File ─▶ Erosion2 / SuperCol
 
 ## Возможности
 
-- **Одна кнопка**: Export > Build > Import, в фоне.
+- **Одна кнопка**: Build (экспорт > Gaea > импорт), в фоне; **Build Chain** собирает
+  по порядку все ноды-мосты выше, неизменённые берутся из кэша.
 - **Эрозионные ноды, четыре выхода**: Terrain, Flow, Wear, Sediment (маски готовы для
   HeightField-нод).
 - **Нода SuperColor**: цветовая карта как текстурированный меш (или цвет точек) и как
@@ -65,11 +66,14 @@ Export-ноды с именами:
    `houdini_gaea_bridge.py`, включая подпапки;
    **Gaea Project** задавайте только ради конкретного файла. **Check Paths** показывает,
    что используется.
-3. Нажмите **Export > Build > Import**.
+3. Нажмите **Build**. Если ноды-мосты идут одна за другой, нажмите **Build Chain** на
+   последней.
 
-Вкладки:
+Вкладки (на каждой одна строка Build | Build Chain | Cancel и Status):
 
-- **Bridge** — разрешение экспорта, опции сборки, пошаговые кнопки, Auto Import.
+- **Bridge** — разрешение экспорта и сборки, слой маски; *Gaea GUI Workflow*
+  (Export / Open in Gaea / Import, Auto Import) для сборки в окне Gaea;
+  **Clear Import** и **Clear Cache**, который удаляет все файлы ноды из её Bridge Dir.
 - **Erosion** / **SuperColor** — *Use ... Template* открывает все параметры ноды Gaea
   из проекта; *Auto Build on Change* пересобирает после каждой правки (нода
   заблокирована до импорта). У SuperColor видна выбранная палитра (читается из

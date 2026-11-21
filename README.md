@@ -13,7 +13,8 @@ Terrain + masks / color ◀── output/output_*.exr ◀───────�
 
 ## Features
 
-- **One button**: Export > Build > Import, in the background.
+- **One button**: Build (export > Gaea > import), in the background; **Build Chain**
+  builds every bridge node above in order, unchanged ones straight from the cache.
 - **Erosion nodes, four outputs**: Terrain, Flow, Wear, Sediment (masks ready for
   HeightField nodes).
 - **SuperColor node**: the color map as a textured mesh (or point colors) and as
@@ -65,11 +66,15 @@ never has to point at the bridge folder. Each bridge node works in its own folde
    subfolders included;
    set **Gaea Project** only to pick a specific file. **Check Paths** shows what is in
    use.
-3. Press **Export > Build > Import**.
+3. Press **Build**. With several bridge nodes in a row, press **Build Chain** on the
+   last one.
 
-Tabs:
+Tabs (each has the same Build | Build Chain | Cancel row and Status):
 
-- **Bridge** — export resolution, build options, step-by-step buttons, Auto Import.
+- **Bridge** — export and build resolution, mask input layer; *Gaea GUI Workflow*
+  (Export / Open in Gaea / Import, Auto Import) for building in the Gaea window;
+  **Clear Import**, and **Clear Cache** which deletes every file the node wrote to its
+  Bridge Dir.
 - **Erosion** / **SuperColor** — *Use ... Template* exposes all parameters of the
   project's Gaea node; *Auto Build on Change* rebuilds after every edit (the node is
   locked until the import). SuperColor shows the chosen palette (read from Gaea's

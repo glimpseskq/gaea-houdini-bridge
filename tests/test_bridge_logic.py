@@ -1138,6 +1138,141 @@ class CleanupTests(unittest.TestCase):
         self.assertFalse(ghb._is_within(os.path.dirname(self.tmp), self.tmp))
 
 
+class ClearCacheTests(unittest.TestCase):
+    """Clear Cache: exactly the files the bridge wrote, nothing else."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.cfg = ghb.BridgeConfig(bridge_dir=os.path.join(self.tmp, "b"))
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _bridge_files(self):
+        out = self.cfg.output_dir
+        files = [self.cfg.input_path, self.cfg.mask_input_path, self.cfg.manifest_path,
+                 ghb.template_build_path(self.cfg),
+                 os.path.join(out, "output_height.exr"),
+                 os.path.join(out, " Output_Flow.exr"),        # Gaea's odd naming
+                 os.path.join(out, "output_wear.tif"),         # other export format
+                 os.path.join(out, " output_tint_combine.exr")]
+        for path in files:
+            _write(path, b"x" * 10)
+        display = os.path.join(self.cfg.bridge_dir, ghb.TINT_DISPLAY_SUBDIR)
+        os.makedirs(display)
+        link = os.path.join(display, "tint_1_10.exr")
+        os.link(files[-1], link)  # display copies are hard links
+        return files + [link]
+
+    def test_lists_only_bridge_files(self):
+        expected = self._bridge_files()
+        foreign = [os.path.join(self.cfg.output_dir, "notes.txt"),
+                   os.path.join(self.cfg.output_dir, "my_render.exr"),
+                   os.path.join(self.cfg.bridge_dir, "keep.hip"),
+                   os.path.join(self.cfg.bridge_dir, ghb.TINT_DISPLAY_SUBDIR, "other.exr")]
+        for path in foreign:
+            _write(path)
+        self.assertEqual(sorted(map(os.path.normcase, ghb.cache_files(self.cfg))),
+                         sorted(map(os.path.normcase, expected)))
+
+    def test_clear_deletes_and_reports_size_once_per_link(self):
+        files = self._bridge_files()
+        keep = os.path.join(self.cfg.output_dir, "my_render.exr")
+        _write(keep)
+        self.assertEqual(ghb.cache_size(files), 10 * (len(files) - 1))
+        result = ghb.clear_cache_files(self.cfg)
+        self.assertEqual(len(result["removed"]), len(files))
+        self.assertEqual(result["failed"], [])
+        self.assertEqual(result["bytes"], 10 * (len(files) - 1))
+        self.assertFalse(any(os.path.exists(p) for p in files))
+        self.assertTrue(os.path.isfile(keep))
+        self.assertFalse(os.path.isdir(
+            os.path.join(self.cfg.bridge_dir, ghb.TINT_DISPLAY_SUBDIR)))
+        self.assertEqual(ghb.cache_files(self.cfg), [])
+
+    def test_supercolor_outputs_and_display(self):
+        cfg = ghb.BridgeConfig(bridge_dir=self.cfg.bridge_dir,
+                               output_maps=ghb.output_maps_for_kind("SuperColor"))
+        sc = os.path.join(cfg.output_dir, "output_supercolor.exr")
+        shown = os.path.join(cfg.bridge_dir, ghb.TINT_DISPLAY_SUBDIR, "supercolor_5_1.exr")
+        height = os.path.join(cfg.output_dir, "output_height.exr")  # not its output
+        for path in (sc, shown, height):
+            _write(path)
+        listed = ghb.cache_files(cfg)
+        self.assertIn(sc, listed)
+        self.assertIn(shown, listed)
+        self.assertNotIn(height, listed)
+
+    def test_empty_folder_and_sizes(self):
+        self.assertEqual(ghb.cache_files(self.cfg), [])
+        self.assertEqual(ghb.clear_cache_files(self.cfg)["removed"], [])
+        self.assertEqual(ghb.format_size(512), "512 bytes")
+        self.assertEqual(ghb.format_size(3 * 1024 * 1024), "3.0 MB")
+        self.assertEqual(ghb.format_size(5 * 1024 ** 3), "5.0 GB")
+
+
+class _GraphNode:
+    """A node in a fake SOP network: inputs(), sessionId(), parm(), isBypassed()."""
+
+    _ids = iter(range(1, 10000))
+
+    def __init__(self, name, bridge=False, bypassed=False, inputs=()):
+        self._name = name
+        self._id = next(self._ids)
+        self._bridge = bridge
+        self._bypassed = bypassed
+        self._inputs = list(inputs)
+
+    def name(self):
+        return self._name
+
+    def sessionId(self):  # noqa: N802 (mirrors the hou API)
+        return self._id
+
+    def inputs(self):
+        return tuple(self._inputs)
+
+    def isBypassed(self):  # noqa: N802
+        return self._bypassed
+
+    def parm(self, name):
+        return _FakeParm(0) if self._bridge and name in ghb.BRIDGE_MARKER_PARMS else None
+
+
+class BuildChainOrderTests(unittest.TestCase):
+    def test_upstream_bridges_in_dependency_order(self):
+        # noise -> A -> distort -> B -> C, with a mask branch noise -> M -> C (input 2)
+        noise = _GraphNode("noise")
+        a = _GraphNode("A", bridge=True, inputs=[noise])
+        distort = _GraphNode("distort", inputs=[a])
+        b = _GraphNode("B", bridge=True, inputs=[distort])
+        m = _GraphNode("M", bridge=True, inputs=[noise])
+        c = _GraphNode("C", bridge=True, inputs=[b, m])
+        order = [n.name() for n in ghb.upstream_bridges(c)]
+        self.assertEqual(order[-1], "C")
+        self.assertEqual(sorted(order), ["A", "B", "C", "M"])
+        self.assertLess(order.index("A"), order.index("B"))
+
+    def test_shared_upstream_built_once_and_bypassed_skipped(self):
+        noise = _GraphNode("noise")
+        a = _GraphNode("A", bridge=True, inputs=[noise])
+        off = _GraphNode("off", bridge=True, bypassed=True, inputs=[a])
+        c = _GraphNode("C", bridge=True, inputs=[off, a])  # A reached twice
+        self.assertEqual([n.name() for n in ghb.upstream_bridges(c)], ["A", "C"])
+
+    def test_node_alone_and_unwired_inputs(self):
+        c = _GraphNode("C", bridge=True, inputs=[None])
+        self.assertEqual([n.name() for n in ghb.upstream_bridges(c)], ["C"])
+
+    def test_deep_network_without_recursion_limit(self):
+        prev = _GraphNode("start")
+        for i in range(3000):
+            prev = _GraphNode("n{}".format(i), bridge=(i % 1000 == 0), inputs=[prev])
+        order = [n.name() for n in ghb.upstream_bridges(prev)]
+        self.assertEqual(order, ["n0", "n1000", "n2000", "n2999"])
+
+
 class HeightScaleTests(unittest.TestCase):
     TERRAIN = {
         "$id": "1",
