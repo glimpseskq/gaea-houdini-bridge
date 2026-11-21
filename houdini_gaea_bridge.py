@@ -70,8 +70,11 @@ DEFAULT_TINT_OUTPUT = "output_tint_combine.exr"
 # color_r / color_g / color_b HeightField layers; never a height.
 COLOR_OUTPUT_MAPS = {"supercolor": "output_supercolor.exr"}
 COLOR_LAYERS = tuple(COLOR_OUTPUT_MAPS)
+# Thermal2 (talus erosion) has no Flow: Out, Wear and Deposits only.
+THERMAL_OUTPUT_MAPS = {layer: DEFAULT_OUTPUT_MAPS[layer]
+                       for layer in ("height", "wear", "sediment")}
 # Node kind -> the Export nodes its bridge expects (other kinds: DEFAULT_OUTPUT_MAPS).
-KIND_OUTPUT_MAPS = {"SuperColor": COLOR_OUTPUT_MAPS}
+KIND_OUTPUT_MAPS = {"SuperColor": COLOR_OUTPUT_MAPS, "Thermal2": THERMAL_OUTPUT_MAPS}
 
 # Mask layers (everything but height) are normalized to 0..1 on import, and one of
 # them can be copied into the "mask" layer, which Houdini draws in the viewport and
@@ -216,6 +219,14 @@ class BridgeConfig:
 def output_maps_for_kind(kind):
     """The output maps a bridge for Gaea node ``kind`` imports."""
     return dict(KIND_OUTPUT_MAPS.get(kind, DEFAULT_OUTPUT_MAPS))
+
+
+def mask_layers_for_kind(kind):
+    """The mask layers (outputs besides height) of an erosion-type bridge, in
+    MASK_LAYERS order: flow, wear, sediment for Erosion2 / Erosion; wear,
+    sediment for Thermal2."""
+    maps = output_maps_for_kind(kind)
+    return tuple(layer for layer in MASK_LAYERS if layer in maps)
 
 
 def primary_output(output_maps):
@@ -533,6 +544,80 @@ def _is_within(child, parent):
         return False
 
 
+CACHE_DISPLAY_PREFIXES = ("tint_",) + tuple(layer + "_" for layer in COLOR_LAYERS)
+
+
+def _stem_key(name):
+    """" Output_Flow.exr" -> "output_flow": how Gaea's Export names are matched."""
+    return os.path.splitext(name)[0].strip().casefold()
+
+
+def cache_files(config):
+    """Every file the bridge wrote into its folder: the exported input and mask,
+    the manifest, the build copy of the project, Gaea's outputs (the configured
+    Export names, any format) and the display copies of color maps. Files that
+    aren't the bridge's (other names, other folders) are never listed."""
+    paths = [config.input_path, config.mask_input_path, config.manifest_path,
+             template_build_path(config)]
+    wanted = {_stem_key(name) for name in config.output_maps.values()}
+    wanted.add(_stem_key(config.tint_output_name))
+    for folder, keep in ((config.output_dir, lambda name: _stem_key(name) in wanted),
+                         (os.path.join(config.bridge_dir, TINT_DISPLAY_SUBDIR),
+                          lambda name: name.startswith(CACHE_DISPLAY_PREFIXES))):
+        try:
+            names = sorted(os.listdir(folder))
+        except OSError:
+            continue
+        paths += [os.path.join(folder, name) for name in names if keep(name)]
+    return [path for path in paths
+            if os.path.isfile(path) and _is_within(path, config.bridge_dir)]
+
+
+def cache_size(paths):
+    """Bytes taken by ``paths``; hard links (display copies) are counted once."""
+    seen, total = set(), 0
+    for path in paths:
+        try:
+            info = os.stat(path)
+        except OSError:
+            continue
+        key = (info.st_dev, info.st_ino) if info.st_ino else path
+        if key not in seen:
+            seen.add(key)
+            total += info.st_size
+    return total
+
+
+def clear_cache_files(config):
+    """Delete ``cache_files(config)``. Returns ``{"removed": [...], "failed":
+    [...], "bytes": freed}``; a file Windows still holds open is reported in
+    "failed" and left for next time."""
+    paths = cache_files(config)
+    size = cache_size(paths)
+    removed, failed = [], []
+    for path in paths:
+        try:
+            os.remove(path)
+            removed.append(path)
+        except OSError:
+            failed.append(path)
+    folder = os.path.join(config.bridge_dir, TINT_DISPLAY_SUBDIR)
+    try:
+        os.rmdir(folder)  # only when empty
+    except OSError:
+        pass
+    freed = size - cache_size(failed)
+    return {"removed": removed, "failed": failed, "bytes": max(0, freed)}
+
+
+def format_size(size):
+    for unit in ("bytes", "KB", "MB"):
+        if size < 1024:
+            return ("{:.0f} {}" if unit == "bytes" else "{:.1f} {}").format(size, unit)
+        size /= 1024.0
+    return "{:.1f} GB".format(size)
+
+
 def cleanup_temp(config, remove_input=True, remove_outputs=False):
     """Delete bridge temp files to save SSD space.
 
@@ -602,12 +687,14 @@ def _collect_nodes(data, kind, found):
     return found
 
 
-MASK_PORT_NAMES = ("mask", "texture")  # Erosion2 / Erosion "Mask", SuperColor "Texture"
+# Erosion2 / Erosion "Mask", SuperColor "Texture", Thermal2 "AreaMask".
+MASK_PORT_NAMES = ("mask", "texture", "areamask")
 
 
 def mask_file_nodes(data):
-    """File nodes of a .terrain that feed a port named "Mask" (e.g. Erosion2's)
-    or "Texture" (SuperColor's): they read the bridge's mask input."""
+    """File nodes of a .terrain that feed a port named "Mask" (e.g. Erosion2's),
+    "Texture" (SuperColor's) or "AreaMask" (Thermal2's): they read the bridge's
+    mask input."""
     sources = set()
 
     def walk(value):
@@ -902,6 +989,18 @@ EROSION1_PARAMS = (
     ("Deterministic", "Deterministic", "Other Settings", "bool", False, 0, 1),
 )
 
+# Thermal2 (QuadSpinner.Gaea.Nodes.Thermal2, Gaea 2.3): talus (thermal) erosion.
+# Outputs Out, Wear, Deposits; mask port AreaMask. The SedimentRemoval input port
+# is left to the project.
+THERMAL2_PARAMS = (
+    ("Duration", "Duration", "Erosion", "float", 0.04, 0.0001, 1.0),
+    ("Strength", "Strength", "Erosion", "float", 0.25, 0.0001, 1.0),
+    ("Anisotropy", "Anisotropy", "Erosion", "float", 0.25, 0.0, 1.0),
+    ("Angle", "Angle", "Talus", "float", 32.0, 0.0, 90.0),
+    ("SedimentRemoval", "Sediment Removal", "Talus", "float", 0.0, 0.0, 1.0),
+    ("FeatureScale", "Feature Scale", "Scale", "float", 25.0, 1.0, 300.0),
+)
+
 # SuperColor (QuadSpinner.Gaea.Nodes.SuperColor, Gaea 2.3): a color map from a
 # palette of Gaea's CLUT library. Range is a Float2 ("float2": default (x, y),
 # min, max per component; stored as {"X": .., "Y": ..}). The palette itself is
@@ -927,7 +1026,7 @@ SUPERCOLOR_PARAMS = (
 
 # Gaea node kind (type name) -> its parameter spec: one bridge HDA per kind.
 EROSION_SPECS = {"Erosion2": EROSION2_PARAMS, "Erosion": EROSION1_PARAMS,
-                 "SuperColor": SUPERCOLOR_PARAMS}
+                 "SuperColor": SUPERCOLOR_PARAMS, "Thermal2": THERMAL2_PARAMS}
 
 
 def erosion_spec(kind):
@@ -3049,7 +3148,7 @@ def _finish_build(node, job, then_import):
             result = import_into_node(node, job.config, set_display=False)
         message += "  " + result["message"]
     elif ok:
-        message += "  Press 3. Import Results to load it."
+        message += "  Press Import (Gaea GUI Workflow) to load it."
     _set_status(node, message)
     return ok, message
 
@@ -3156,7 +3255,22 @@ def _stop_build_watch(key):
 
 
 def cancel_build(node):
-    """Stop the node's running Swarm build (or a pending auto rebuild) and unlock."""
+    """Stop the node's running Swarm build (or a pending auto rebuild) and unlock.
+    On a node taking part in a Build Chain, stops the whole chain."""
+    import hou
+
+    chain = _chain_of(node)
+    if chain is not None:
+        chain["cancelled"] = True
+        current = hou.nodeBySessionId(chain["keys"][chain["index"]]) \
+            if 0 <= chain["index"] < len(chain["keys"]) else None
+        if current is None or not _cancel_single_build(current):
+            _finish_chain(chain, False)  # nothing running right now: stop here
+        return True
+    return _cancel_single_build(node)
+
+
+def _cancel_single_build(node):
     _cancel_pending_rebuild(node.sessionId())
     entry = _stop_build_watch(node.sessionId())
     if entry is None or entry["job"].poll() is not None:
@@ -3171,12 +3285,13 @@ def cancel_build(node):
     return True
 
 
-def run_full_cycle(node, wait=None, on_done=None):
+def run_full_cycle(node, wait=None, on_done=None, report=None):
     """Export -> build in Gaea (Swarm) -> import, all from the node.
 
     When the export cache says nothing changed and the outputs exist, the build is
     skipped and the existing outputs are imported. ``on_done(ok)`` is called when
-    everything is over (see ``build_in_gaea``).
+    everything is over (see ``build_in_gaea``). ``report`` (a dict) gets
+    "cached": True when the cache made the build unnecessary.
     """
     try:
         export = export_from_node(node)
@@ -3185,6 +3300,8 @@ def run_full_cycle(node, wait=None, on_done=None):
             result = import_into_node(node, config)
             _set_status(node, "Nothing changed since the last build.  "
                         + result["message"])
+            if report is not None:
+                report["cached"] = True
             _call_done(on_done, True)
             return None
     except Exception:
@@ -3192,6 +3309,247 @@ def run_full_cycle(node, wait=None, on_done=None):
         raise
     _set_status(node, export["message"])
     return build_in_gaea(node, then_import=True, wait=wait, on_done=on_done)
+
+
+# --------------------------------------------------------------------------- #
+# Build Chain: every bridge node above this one, in order, then this one
+# --------------------------------------------------------------------------- #
+
+BRIDGE_MARKER_PARMS = ("_imported", "erosion_kind")
+
+
+def is_bridge_node(node):
+    """True for a Gaea bridge HDA node (any kind)."""
+    try:
+        return all(node.parm(name) is not None for name in BRIDGE_MARKER_PARMS)
+    except Exception:  # noqa: BLE001 - not a node with parameters
+        return False
+
+
+def upstream_bridges(node):
+    """The bridge nodes whose result reaches ``node`` through its inputs (both
+    terrain and mask, through any other nodes), each listed after every bridge
+    it depends on, then ``node`` itself. Bypassed bridges are skipped: their
+    result isn't used. Iterative, so deep networks don't hit Python's limit."""
+    order, done, stack = [], set(), [(node, False)]
+    while stack:
+        current, expanded = stack.pop()
+        key = current.sessionId()
+        if expanded:
+            if key in done:
+                continue
+            done.add(key)
+            if key == node.sessionId() or (
+                    is_bridge_node(current) and not current.isBypassed()):
+                order.append(current)
+            continue
+        if key in done:
+            continue
+        stack.append((current, True))
+        for source in reversed([n for n in current.inputs() if n is not None]):
+            if source.sessionId() not in done:
+                stack.append((source, False))
+    return order
+
+
+def _chain_registry():
+    """Running chains: {"chains": {owner key: state}, "members": {key: owner}}."""
+    import hou
+
+    registry = getattr(hou.session, "_ghb_chains", None)
+    if registry is None:
+        registry = {"chains": {}, "members": {}}
+        hou.session._ghb_chains = registry
+    return registry
+
+
+def _chain_of(node):
+    registry = _chain_registry()
+    owner = registry["members"].get(node.sessionId())
+    return registry["chains"].get(owner) if owner is not None else None
+
+
+def is_chain_running(node):
+    return _chain_of(node) is not None
+
+
+def _node_name(key):
+    import hou
+
+    node = hou.nodeBySessionId(key)
+    return node.name() if node is not None else "(deleted node)"
+
+
+def _finish_chain(chain, ok, error=None):
+    """Unlock the chain's nodes, forget the chain and report on its owner."""
+    import hou
+
+    if chain.get("finished"):
+        return
+    chain["finished"] = True
+    registry = _chain_registry()
+    registry["chains"].pop(chain["owner"], None)
+    for key in chain["keys"]:
+        registry["members"].pop(key, None)
+        target = hou.nodeBySessionId(key)
+        if target is not None:
+            set_locked(target, False)
+    owner = hou.nodeBySessionId(chain["owner"])
+    elapsed = time.time() - chain["started"]
+    steps = ", ".join("{} ({})".format(_node_name(key), how)
+                      for key, how in chain["results"])
+    if ok:
+        message = "Build Chain done in {:.0f} s: {}.".format(elapsed, steps)
+    else:
+        stopped = _node_name(chain["keys"][chain["index"]]) \
+            if 0 <= chain["index"] < len(chain["keys"]) else "?"
+        if chain["cancelled"]:
+            reason = "cancelled"
+        else:
+            reason = "failed"
+            detail = error
+            node = hou.nodeBySessionId(chain["keys"][chain["index"]]) \
+                if 0 <= chain["index"] < len(chain["keys"]) else None
+            if detail is None and node is not None and node.parm("_status") is not None:
+                detail = node.evalParm("_status")
+            if detail:
+                reason += ": {}".format(detail)
+        message = "Build Chain stopped at {} after {:.0f} s ({}).{}".format(
+            stopped, elapsed, reason, "  Done before: {}.".format(steps) if steps else "")
+    if owner is not None:
+        _set_status(owner, message)
+    callback = chain.get("on_done")
+    if callback is not None:
+        _call_done(callback, ok)
+
+
+def build_chain(node, wait=None, on_done=None):
+    """Build Chain button: Export > Build > Import on every bridge node above
+    ``node`` (see ``upstream_bridges``), one after another so each one exports
+    the result of the ones before it, then on ``node``. Unchanged nodes come
+    straight from the build cache. The chain's nodes are locked while it runs;
+    Cancel on any of them stops it. Returns the list of nodes in build order."""
+    nodes = upstream_bridges(node)
+    keys = [n.sessionId() for n in nodes]
+    registry = _chain_registry()
+    busy = [n.name() for n in nodes
+            if n.sessionId() in registry["members"] or is_building(n)]
+    if busy:
+        _set_status(node, "Build Chain not started: already building {}.".format(
+            ", ".join(busy)))
+        _call_done(on_done, False)
+        return nodes
+    chain = {"owner": node.sessionId(), "keys": keys, "index": -1, "results": [],
+             "cancelled": False, "started": time.time(), "on_done": on_done}
+    registry["chains"][chain["owner"]] = chain
+    for n in nodes:
+        registry["members"][n.sessionId()] = chain["owner"]
+        set_locked(n, True)
+    if len(nodes) == 1:
+        _set_status(node, "Build Chain: no bridge nodes above this one; building it.")
+    _chain_step(chain, True, wait)
+    return nodes
+
+
+def _chain_step(chain, ok, wait):
+    """Called when the previous node is done (``ok``): start the next one."""
+    import hou
+
+    if chain.get("finished"):
+        return
+    if not ok or chain["cancelled"]:
+        _finish_chain(chain, False)
+        return
+    chain["index"] += 1
+    if chain["index"] >= len(chain["keys"]):
+        _finish_chain(chain, True)
+        return
+    key = chain["keys"][chain["index"]]
+    target = hou.nodeBySessionId(key)
+    if target is None:
+        _finish_chain(chain, False, "the node was deleted")
+        return
+    owner = hou.nodeBySessionId(chain["owner"])
+    progress = "Build Chain {}/{}: {}...".format(
+        chain["index"] + 1, len(chain["keys"]), target.name())
+    if owner is not None and owner.sessionId() != key:
+        _set_status(owner, progress)
+    index = chain["index"]
+    report = {"cached": False}
+    # While run_full_cycle is still running here, a failure is finished below
+    # (with the exception's text, if any); later (a background build in the
+    # UI), by the callback itself.
+    call = {"inside": True, "failed": False}
+
+    def done(step_ok):
+        if chain.get("finished") or chain["index"] != index:
+            return
+        if step_ok:
+            chain["results"].append((key, "cached" if report["cached"] else "built"))
+            _chain_step(chain, True, wait)
+        elif call["inside"]:
+            call["failed"] = True
+        else:
+            _finish_chain(chain, False)
+
+    try:
+        run_full_cycle(target, wait=wait, on_done=done, report=report)
+    except Exception as error:  # export failed (done(False) already ran)
+        call["inside"] = False
+        _finish_chain(chain, False, str(error))
+        return
+    call["inside"] = False
+    if call["failed"]:
+        _finish_chain(chain, False)
+
+
+# --------------------------------------------------------------------------- #
+# Clear Cache: delete the files the bridge wrote
+# --------------------------------------------------------------------------- #
+
+def clear_cache(node, confirm=True):
+    """Clear Cache button: clear the import, then delete every file this node's
+    bridge wrote (exported input and mask, manifest, build copy, Gaea outputs,
+    display copies). The next Build exports and builds from scratch. Returns
+    the status message."""
+    import hou
+
+    if is_building(node) or is_chain_running(node):
+        message = "Clear Cache: a build is running for this node; cancel it first."
+        _set_status(node, message)
+        return message
+    config = config_from_node(node)
+    paths = cache_files(config)
+    if not paths:
+        message = "Clear Cache: nothing to delete in {}.".format(config.bridge_dir)
+        _set_status(node, message)
+        return message
+    if confirm and hou.isUIAvailable():
+        choice = hou.ui.displayMessage(
+            "Delete {} files ({}) the bridge wrote to\n{}?\n\nThe import is cleared "
+            "too; the next Build exports and builds from scratch.".format(
+                len(paths), format_size(cache_size(paths)), config.bridge_dir),
+            buttons=("Delete", "Cancel"), default_choice=1, close_choice=1,
+            title="Gaea Bridge: Clear Cache")
+        if choice != 0:
+            message = "Clear Cache cancelled."
+            _set_status(node, message)
+            return message
+    clear_node_import(node)
+    try:
+        node.cook(force=True)  # the file nodes let go of the maps
+    except hou.OperationFailed:
+        pass
+    result = clear_cache_files(config)
+    message = "Cache cleared: {} files ({}) deleted from {}.".format(
+        len(result["removed"]), format_size(result["bytes"]), config.bridge_dir)
+    if result["failed"]:
+        message += "  {} files are in use and were left: {}.".format(
+            len(result["failed"]),
+            ", ".join(os.path.basename(p).strip() for p in result["failed"][:4]))
+    message += "  Import cleared: the node passes its input through."
+    _set_status(node, message)
+    return message
 
 
 # --------------------------------------------------------------------------- #

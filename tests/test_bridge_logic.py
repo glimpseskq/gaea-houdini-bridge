@@ -18,6 +18,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import houdini_gaea_bridge as ghb  # noqa: E402
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+
 
 def _write(path, data=b"data"):
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -487,6 +489,98 @@ class Erosion1TemplateTests(unittest.TestCase):
         first = ghb.build_settings(self.cfg)
         self.cfg.erosion_kind = "Erosion2"
         self.assertNotEqual(first, ghb.build_settings(self.cfg))
+
+
+class Thermal2Tests(unittest.TestCase):
+    """Gaea Thermal2 Bridge: height + Wear + Deposits (no Flow), AreaMask port."""
+
+    SAMPLE = os.path.join(HERE, "..", "GaeaTerrain", "thermal2.terrain")
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.cfg = ghb.BridgeConfig(bridge_dir=os.path.join(self.tmp, "bridge"),
+                                    gaea_project=os.path.join(self.tmp, "t2.terrain"),
+                                    erosion_kind="Thermal2", use_template=True,
+                                    output_maps=ghb.output_maps_for_kind("Thermal2"))
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _project(self, mask=True, **values):
+        nodes = {
+            "1": {"$type": "QuadSpinner.Gaea.Nodes.File, Gaea.Nodes", "Id": 1,
+                  "FileName": "D:\\x\\input_height.exr"},
+            "2": {"$type": "QuadSpinner.Gaea.Nodes.File, Gaea.Nodes", "Id": 2,
+                  "FileName": ""},
+            "3": dict({"$type": "QuadSpinner.Gaea.Nodes.Thermal2, Gaea.Nodes", "Id": 3,
+                       "Name": "Thermal2", "Ports": {"$values": [
+                           {"Name": "In", "Record": {"From": 1, "ToPort": "In"}}] + (
+                           [{"Name": "AreaMask",
+                             "Record": {"From": 2, "ToPort": "AreaMask"}}]
+                           if mask else [])}}, **values),
+        }
+        for i, name in enumerate(("output_height", "output_wear", "output_sediment"), 4):
+            nodes[str(i)] = {"$type": "QuadSpinner.Gaea.Nodes.Export, Gaea.Nodes",
+                             "Id": i, "Name": name}
+        with open(self.cfg.gaea_project, "w", encoding="utf-8") as handle:
+            json.dump({"Assets": {"$values": [{"Terrain": {"Nodes": nodes}}]}}, handle)
+
+    def test_spec_matches_gaea(self):
+        names = [spec[0] for spec in ghb.THERMAL2_PARAMS]
+        self.assertEqual(names, ["Duration", "Strength", "Anisotropy", "Angle",
+                                 "SedimentRemoval", "FeatureScale"])
+        for name, _, _, kind, default, low, high in ghb.THERMAL2_PARAMS:
+            self.assertEqual(kind, "float", name)
+            self.assertTrue(low <= default <= high, name)
+        self.assertIs(ghb.erosion_spec("Thermal2"), ghb.THERMAL2_PARAMS)
+
+    def test_outputs_masks_and_project(self):
+        self.assertEqual(ghb.output_maps_for_kind("Thermal2"), {
+            "height": "output_height.exr", "wear": "output_wear.exr",
+            "sediment": "output_sediment.exr"})
+        self.assertEqual(ghb.mask_layers_for_kind("Thermal2"), ("wear", "sediment"))
+        self.assertEqual(ghb.mask_layers_for_kind("Erosion2"), ghb.MASK_LAYERS)
+        self.assertEqual(self.cfg.primary_output, "height")
+        self.assertEqual(ghb.project_name_for_kind("Thermal2"), "thermal2.terrain")
+        self._project()
+        self.assertEqual(ghb.find_project_for_kind(self.tmp, "Thermal2"),
+                         self.cfg.gaea_project)
+        # An Erosion2 bridge never picks a Thermal2 project.
+        self.assertIsNone(ghb.find_project_for_kind(self.tmp, "Erosion2"))
+
+    def test_copy_writes_values_and_area_mask(self):
+        self._project(Strength=0.45)
+        self.assertEqual(ghb.check_project_paths(self.cfg, fix_mask_paths=True), [])
+        self.cfg.erosion_params = {"Strength": 0.45, "Angle": 40.0, "FeatureScale": 25.0}
+        dst = ghb.template_build_path(self.cfg)
+        changed = ghb.write_template_copy(self.cfg, dst)
+        self.assertIn("Angle", changed)
+        self.assertIn("mask file", changed)
+        with open(dst, encoding="utf-8") as handle:
+            data = json.load(handle)
+        node = ghb.find_erosion_node(data, kind="Thermal2")
+        self.assertEqual(node["Angle"], 40.0)
+        self.assertNotIn("FeatureScale", node)  # Gaea default: not written
+        mask = ghb.mask_file_nodes(data)
+        self.assertEqual(len(mask), 1)
+        self.assertTrue(ghb._same_path(mask[0]["FileName"], self.cfg.mask_input_path))
+
+    @unittest.skipUnless(os.path.isfile(SAMPLE), "sample project not present")
+    def test_sample_project(self):
+        values = ghb.read_erosion_params(self.SAMPLE, kind="Thermal2")
+        self.assertAlmostEqual(values["Strength"], 0.45507553, places=6)
+        self.assertEqual(values["Angle"], 32.0)  # not saved: Gaea default
+        cfg = ghb.BridgeConfig(bridge_dir=self.cfg.bridge_dir, gaea_project=self.SAMPLE,
+                               erosion_kind="Thermal2", use_template=True,
+                               erosion_params={"Angle": 40.0},
+                               output_maps=ghb.output_maps_for_kind("Thermal2"))
+        # The build copy points the File and all three Exports at the bridge.
+        copy = ghb.template_build_path(cfg)
+        changed = ghb.write_template_copy(cfg, copy)
+        self.assertEqual(changed, ["Angle", "input file", "export paths"])
+        cfg.gaea_project = copy
+        self.assertEqual(ghb.check_project_paths(cfg), [])
 
 
 class SuperColorTests(unittest.TestCase):
@@ -1136,6 +1230,141 @@ class CleanupTests(unittest.TestCase):
     def test_is_within_helper(self):
         self.assertTrue(ghb._is_within(os.path.join(self.tmp, "a", "b"), self.tmp))
         self.assertFalse(ghb._is_within(os.path.dirname(self.tmp), self.tmp))
+
+
+class ClearCacheTests(unittest.TestCase):
+    """Clear Cache: exactly the files the bridge wrote, nothing else."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.cfg = ghb.BridgeConfig(bridge_dir=os.path.join(self.tmp, "b"))
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _bridge_files(self):
+        out = self.cfg.output_dir
+        files = [self.cfg.input_path, self.cfg.mask_input_path, self.cfg.manifest_path,
+                 ghb.template_build_path(self.cfg),
+                 os.path.join(out, "output_height.exr"),
+                 os.path.join(out, " Output_Flow.exr"),        # Gaea's odd naming
+                 os.path.join(out, "output_wear.tif"),         # other export format
+                 os.path.join(out, " output_tint_combine.exr")]
+        for path in files:
+            _write(path, b"x" * 10)
+        display = os.path.join(self.cfg.bridge_dir, ghb.TINT_DISPLAY_SUBDIR)
+        os.makedirs(display)
+        link = os.path.join(display, "tint_1_10.exr")
+        os.link(files[-1], link)  # display copies are hard links
+        return files + [link]
+
+    def test_lists_only_bridge_files(self):
+        expected = self._bridge_files()
+        foreign = [os.path.join(self.cfg.output_dir, "notes.txt"),
+                   os.path.join(self.cfg.output_dir, "my_render.exr"),
+                   os.path.join(self.cfg.bridge_dir, "keep.hip"),
+                   os.path.join(self.cfg.bridge_dir, ghb.TINT_DISPLAY_SUBDIR, "other.exr")]
+        for path in foreign:
+            _write(path)
+        self.assertEqual(sorted(map(os.path.normcase, ghb.cache_files(self.cfg))),
+                         sorted(map(os.path.normcase, expected)))
+
+    def test_clear_deletes_and_reports_size_once_per_link(self):
+        files = self._bridge_files()
+        keep = os.path.join(self.cfg.output_dir, "my_render.exr")
+        _write(keep)
+        self.assertEqual(ghb.cache_size(files), 10 * (len(files) - 1))
+        result = ghb.clear_cache_files(self.cfg)
+        self.assertEqual(len(result["removed"]), len(files))
+        self.assertEqual(result["failed"], [])
+        self.assertEqual(result["bytes"], 10 * (len(files) - 1))
+        self.assertFalse(any(os.path.exists(p) for p in files))
+        self.assertTrue(os.path.isfile(keep))
+        self.assertFalse(os.path.isdir(
+            os.path.join(self.cfg.bridge_dir, ghb.TINT_DISPLAY_SUBDIR)))
+        self.assertEqual(ghb.cache_files(self.cfg), [])
+
+    def test_supercolor_outputs_and_display(self):
+        cfg = ghb.BridgeConfig(bridge_dir=self.cfg.bridge_dir,
+                               output_maps=ghb.output_maps_for_kind("SuperColor"))
+        sc = os.path.join(cfg.output_dir, "output_supercolor.exr")
+        shown = os.path.join(cfg.bridge_dir, ghb.TINT_DISPLAY_SUBDIR, "supercolor_5_1.exr")
+        height = os.path.join(cfg.output_dir, "output_height.exr")  # not its output
+        for path in (sc, shown, height):
+            _write(path)
+        listed = ghb.cache_files(cfg)
+        self.assertIn(sc, listed)
+        self.assertIn(shown, listed)
+        self.assertNotIn(height, listed)
+
+    def test_empty_folder_and_sizes(self):
+        self.assertEqual(ghb.cache_files(self.cfg), [])
+        self.assertEqual(ghb.clear_cache_files(self.cfg)["removed"], [])
+        self.assertEqual(ghb.format_size(512), "512 bytes")
+        self.assertEqual(ghb.format_size(3 * 1024 * 1024), "3.0 MB")
+        self.assertEqual(ghb.format_size(5 * 1024 ** 3), "5.0 GB")
+
+
+class _GraphNode:
+    """A node in a fake SOP network: inputs(), sessionId(), parm(), isBypassed()."""
+
+    _ids = iter(range(1, 10000))
+
+    def __init__(self, name, bridge=False, bypassed=False, inputs=()):
+        self._name = name
+        self._id = next(self._ids)
+        self._bridge = bridge
+        self._bypassed = bypassed
+        self._inputs = list(inputs)
+
+    def name(self):
+        return self._name
+
+    def sessionId(self):  # noqa: N802 (mirrors the hou API)
+        return self._id
+
+    def inputs(self):
+        return tuple(self._inputs)
+
+    def isBypassed(self):  # noqa: N802
+        return self._bypassed
+
+    def parm(self, name):
+        return _FakeParm(0) if self._bridge and name in ghb.BRIDGE_MARKER_PARMS else None
+
+
+class BuildChainOrderTests(unittest.TestCase):
+    def test_upstream_bridges_in_dependency_order(self):
+        # noise -> A -> distort -> B -> C, with a mask branch noise -> M -> C (input 2)
+        noise = _GraphNode("noise")
+        a = _GraphNode("A", bridge=True, inputs=[noise])
+        distort = _GraphNode("distort", inputs=[a])
+        b = _GraphNode("B", bridge=True, inputs=[distort])
+        m = _GraphNode("M", bridge=True, inputs=[noise])
+        c = _GraphNode("C", bridge=True, inputs=[b, m])
+        order = [n.name() for n in ghb.upstream_bridges(c)]
+        self.assertEqual(order[-1], "C")
+        self.assertEqual(sorted(order), ["A", "B", "C", "M"])
+        self.assertLess(order.index("A"), order.index("B"))
+
+    def test_shared_upstream_built_once_and_bypassed_skipped(self):
+        noise = _GraphNode("noise")
+        a = _GraphNode("A", bridge=True, inputs=[noise])
+        off = _GraphNode("off", bridge=True, bypassed=True, inputs=[a])
+        c = _GraphNode("C", bridge=True, inputs=[off, a])  # A reached twice
+        self.assertEqual([n.name() for n in ghb.upstream_bridges(c)], ["A", "C"])
+
+    def test_node_alone_and_unwired_inputs(self):
+        c = _GraphNode("C", bridge=True, inputs=[None])
+        self.assertEqual([n.name() for n in ghb.upstream_bridges(c)], ["C"])
+
+    def test_deep_network_without_recursion_limit(self):
+        prev = _GraphNode("start")
+        for i in range(3000):
+            prev = _GraphNode("n{}".format(i), bridge=(i % 1000 == 0), inputs=[prev])
+        order = [n.name() for n in ghb.upstream_bridges(prev)]
+        self.assertEqual(order, ["n0", "n1000", "n2000", "n2999"])
 
 
 class HeightScaleTests(unittest.TestCase):

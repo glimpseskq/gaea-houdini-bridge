@@ -13,7 +13,8 @@ Terrain + masks / color ◀── output/output_*.exr ◀───────�
 
 ## Features
 
-- **One button**: Export > Build > Import, in the background.
+- **One button**: Build (export > Gaea > import), in the background; **Build Chain**
+  builds every bridge node above in order, unchanged ones straight from the cache.
 - **Erosion nodes, four outputs**: Terrain, Flow, Wear, Sediment (masks ready for
   HeightField nodes).
 - **SuperColor node**: the color map as a textured mesh (or point colors) and as
@@ -35,21 +36,22 @@ Terrain + masks / color ◀── output/output_*.exr ◀───────�
    ```python
    exec(open(r"C:/path/to/BridgeHGH/build_gaea_bridge_hda.py").read())
    ```
-   Three nodes appear in the SOP Tab menu: **Gaea Erosion2 Bridge**, **Gaea Erosion
-   Bridge** (the older Erosion node) and **Gaea SuperColor Bridge**. They work the
-   same; each exposes its own Gaea node's parameters.
+   Four nodes appear in the SOP Tab menu: **Gaea Erosion2 Bridge**, **Gaea Erosion
+   Bridge** (the older Erosion node), **Gaea Thermal2 Bridge** and **Gaea SuperColor
+   Bridge**. They work the same; each exposes its own Gaea node's parameters.
 
 ## Gaea project (once)
 
-`File` (any path; the bridge sets it) → **Erosion2** / **Erosion** / **SuperColor** →
-Export nodes named:
+`File` (any path; the bridge sets it) → **Erosion2** / **Erosion** / **Thermal2** /
+**SuperColor** → Export nodes named:
 
 | Gaea output | Export node |
 |-------------|-------------|
 | Erosion2 Out / Flow / Wear / Deposits | `output_height` / `output_flow` / `output_wear` / `output_sediment` |
+| Thermal2 Out / Wear / Deposits (no Flow) | `output_height` / `output_wear` / `output_sediment` |
 | color map (Tint nodes → Combine), optional | `output_tint_combine` |
 | SuperColor Out | `output_supercolor` |
-| Mask / Texture port ← second `File` node | loads `<Bridge Dir>/input_mask.exr` |
+| Mask / AreaMask / Texture port ← second `File` node | loads `<Bridge Dir>/input_mask.exr` |
 
 Export format EXR. The bridge builds a copy of the project and sets every path in it
 (input File, mask File, Export locations), so the saved project is never modified and
@@ -60,17 +62,22 @@ never has to point at the bridge folder. Each bridge node works in its own folde
 
 1. Connect a HeightField (and optionally a mask) to the node.
 2. **Paths** tab, once: **Gaea Exe** (shared by every bridge node). Each node finds its
-   project by itself (`erosion2.terrain` / `erosion.terrain` / `supercolor.terrain`, else
+   project by itself (`erosion2.terrain` / `erosion.terrain` / `thermal2.terrain` /
+   `supercolor.terrain`, else
    any project with that node) in the scene folder or next to `houdini_gaea_bridge.py`,
    subfolders included;
    set **Gaea Project** only to pick a specific file. **Check Paths** shows what is in
    use.
-3. Press **Export > Build > Import**.
+3. Press **Build**. With several bridge nodes in a row, press **Build Chain** on the
+   last one.
 
-Tabs:
+Tabs (each has the same Build | Build Chain | Cancel row and Status):
 
-- **Bridge** — export resolution, build options, step-by-step buttons, Auto Import.
-- **Erosion** / **SuperColor** — *Use ... Template* exposes all parameters of the
+- **Bridge** — export and build resolution, mask input layer; *Gaea GUI Workflow*
+  (Export / Open in Gaea / Import, Auto Import) for building in the Gaea window;
+  **Clear Import**, and **Clear Cache** which deletes every file the node wrote to its
+  Bridge Dir.
+- **Erosion** / **Thermal2** / **SuperColor** — *Use ... Template* exposes all parameters of the
   project's Gaea node; *Auto Build on Change* rebuilds after every edit (the node is
   locked until the import). SuperColor shows the chosen palette (read from Gaea's
   `Resources/Color/*.clut`); **Choose Palette...** opens a window with every palette

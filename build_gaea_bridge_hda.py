@@ -32,11 +32,17 @@ Outputs 2-4 have the same layout as output 1 (height + mask), so each plugs
 straight into the Mask input of HeightField nodes.
 """
 
+import importlib
 import os
 
 import hou
 
 import houdini_gaea_bridge as ghb
+
+# Rebuilding the HDAs after an update must also bring in the updated module:
+# Python keeps the version imported earlier in this Houdini session, and the
+# new buttons would call functions it doesn't have yet.
+ghb = importlib.reload(ghb)
 
 
 # One HDA per Gaea erosion node. The Erosion2 type name stays "gaea_erosion_bridge"
@@ -54,12 +60,32 @@ ASSETS = {
     "SuperColor": {"type_name": "gaea_supercolor_bridge",
                    "label": "Gaea SuperColor Bridge", "node_name": None,
                    "profile": "color"},
+    # Talus erosion: same as the erosion bridges, but only Wear and Deposits
+    # (no Flow), so three outputs: Terrain, Wear, Sediment.
+    "Thermal2": {"type_name": "gaea_thermal2_bridge", "label": "Gaea Thermal2 Bridge",
+                 "node_name": None, "profile": "erosion"},
 }
 ASSET_TYPE_NAME = ASSETS["Erosion2"]["type_name"]
 ASSET_LABEL = ASSETS["Erosion2"]["label"]
 NODE_NAME = ASSETS["Erosion2"]["node_name"]
 
-MASK_LAYERS = ("flow", "wear", "sediment")
+MASK_LAYERS = ("flow", "wear", "sediment")  # every mask any erosion bridge can have
+
+# Gaea's name of each mask output and what it shows, for labels and help.
+MASK_INFO = {
+    "flow": ("Flow", "Flow", "Where water runs: thin channel networks."),
+    "wear": ("Wear", "Wear", "Where material was eroded away."),
+    "sediment": ("Sediment", "Deposits", "Where eroded material was deposited."),
+}
+
+# The node tab is called "Erosion" on the two hydraulic erosion bridges (their
+# parameter names predate the other kinds), else after the Gaea node.
+EROSION_TAB_KINDS = ("Erosion2", "Erosion")
+
+
+def _mask_layers(node_kind):
+    """Mask layers of an erosion-profile bridge (Thermal2: wear, sediment)."""
+    return ghb.mask_layers_for_kind(node_kind)
 
 
 # The callback snippets stored on the buttons. Button callbacks run in their own
@@ -127,14 +153,19 @@ except Exception:
     pass
 """.strip()
 
-BUILD_CALLBACK = r"""
-import houdini_gaea_bridge as ghb
-ghb.build_in_gaea(kwargs['node'])
-""".strip()
-
 CYCLE_CALLBACK = r"""
 import houdini_gaea_bridge as ghb
 ghb.run_full_cycle(kwargs['node'])
+""".strip()
+
+CHAIN_CALLBACK = r"""
+import houdini_gaea_bridge as ghb
+ghb.build_chain(kwargs['node'])
+""".strip()
+
+CLEAR_CACHE_CALLBACK = r"""
+import houdini_gaea_bridge as ghb
+ghb.clear_cache(kwargs['node'])
 """.strip()
 
 CANCEL_CALLBACK = r"""
@@ -207,17 +238,18 @@ def _has_layer_expr(layer):
     return 'strlen(chs("../_{0}_file")) > 0'.format(layer)
 
 
-# Mask layers are dropped from every output once the wanted one is in "mask".
+# Mask layers are dropped from every output once the wanted one is in "mask"
+# (all names: a group naming a layer a bridge doesn't have matches nothing).
 EXTRA_LAYERS_GROUP = " ".join("@name=" + layer for layer in MASK_LAYERS)
 
 
 HEIGHT_FROM_GAEA_EXPR = 'strlen(chs("../_height_file")) > 0 && ch("../height_source") == 0'
 
 
-def _process_vex():
+def _process_vex(layers=MASK_LAYERS):
     """Per-voxel processing of the imported layers (runs in a Volume Wrangle)."""
     lines = [
-        "// Gaea Erosion2 Bridge: driven by the asset's parameters.",
+        "// Gaea bridge: driven by the asset's parameters.",
         "",
         "// Height: Gaea 0..1 -> Houdini units, only when the height comes from Gaea.",
         'if (chi("../height_source") == 0 && strlen(chs("../_height_file")) > 0'
@@ -238,15 +270,15 @@ def _process_vex():
         '    f@{0} = v * chf("../{0}_strength");',
         "}}",
     ])
-    for layer in MASK_LAYERS:
+    for layer in layers:
         lines.append(block.format(layer))
     return "\n".join(lines) + "\n"
 
 
-def _show_mask_vex():
+def _show_mask_vex(layers=MASK_LAYERS):
     """Terrain output preview: the mask chosen in Show Mask goes into "mask"."""
     lines = ['string sel = chs("../view_mask");']
-    for layer in MASK_LAYERS:
+    for layer in layers:
         lines.append('if (sel == "{0}") f@mask = f@{0};'.format(layer))
     return "\n".join(lines) + "\n"
 
@@ -314,14 +346,15 @@ def _switch(parent, name, inputs, index_expr):
     return node
 
 
-def _build_network(subnet):
+def _build_network(subnet, layers=MASK_LAYERS):
+    """Erosion profile: height + one output per mask in ``layers``."""
     source = subnet.indirectInputs()[0]
 
     gaea_height = _file_node(subnet, "file_height", None, "heightfield", "height")
     prev = _switch(subnet, "height_source_switch", (source, gaea_height),
                    HEIGHT_FROM_GAEA_EXPR)
 
-    for layer in MASK_LAYERS:
+    for layer in layers:
         file_node = _file_node(subnet, "file_" + layer, prev, "mask", layer)
         prev = _switch(subnet, "use_" + layer, (prev, file_node),
                        _has_layer_expr(layer))
@@ -331,10 +364,10 @@ def _build_network(subnet):
 
     process = subnet.createNode("volumewrangle", "process_layers")
     process.setInput(0, raw)
-    _setp(process, "snippet", _process_vex())
+    _setp(process, "snippet", _process_vex(layers))
     prev = process
 
-    for layer in MASK_LAYERS:
+    for layer in layers:
         blur = subnet.createNode("heightfield_blur", "blur_" + layer)
         blur.setInput(0, prev)
         _setp(blur, ("layer", "blurlayer"), layer)
@@ -355,9 +388,9 @@ def _build_network(subnet):
 
     # Output 1 - Terrain: height; "mask" shows the Show Mask choice (None = the
     # input's own mask, empty for a Gaea result).
-    branches = [("TERRAIN", mask_branch("terrain", _show_mask_vex()))]
-    # Outputs 2-4 - one per Gaea mask, as "mask" on the same height.
-    for layer in MASK_LAYERS:
+    branches = [("TERRAIN", mask_branch("terrain", _show_mask_vex(layers)))]
+    # Outputs 2.. - one per Gaea mask, as "mask" on the same height.
+    for layer in layers:
         branches.append((layer.upper(), mask_branch(
             layer, "f@mask = f@{};\n".format(layer))))
 
@@ -565,10 +598,33 @@ def _erosion_parm(node_kind, name, label, kind, default, low, high):
                                  max_is_strict=True, help=help_text, **callback)
 
 
-# While a build started by Auto Build on Change runs, every parameter is disabled
-# through this condition, except the ones that must stay usable.
+# While a build started by Auto Build on Change or Build Chain runs, every
+# parameter is disabled through this condition, except the Cancel buttons.
 LOCK_CONDITION = "{ _locked == 1 }"
-NEVER_LOCKED = ("cancel_build", "cancel_build_erosion")
+# Each tab with actions has the same row: Build | Build Chain | Cancel + Status.
+# Suffixes keep the parameter names of earlier versions (run_cycle_erosion, ...).
+ACTION_SUFFIXES = ("", "_erosion", "_tint", "_color")
+NEVER_LOCKED = tuple("cancel_build" + suffix for suffix in ACTION_SUFFIXES)
+
+
+def _action_row(suffix=""):
+    """Build | Build Chain | Cancel on one line, with the Status field below."""
+    build = _button(
+        "run_cycle" + suffix, "Build", CYCLE_CALLBACK,
+        "Export > Build > Import: export the input, build the Gaea project with "
+        "Gaea.Swarm.exe in the background (no Gaea window), import the result. "
+        "Unchanged input and settings: the last result is imported at once.")
+    chain = _button(
+        "build_chain" + suffix, "Build Chain", CHAIN_CALLBACK,
+        "Build every Gaea bridge node above this one, in order (each exports the "
+        "result of the ones before it), then this one. Unchanged nodes come "
+        "straight from their cache. The nodes are locked until the chain ends; "
+        "Cancel on any of them stops it.")
+    cancel = _button("cancel_build" + suffix, "Cancel", CANCEL_CALLBACK,
+                     "Stop the running build (or Build Chain) and unlock the node.")
+    build.setJoinWithNext(True)
+    chain.setJoinWithNext(True)
+    return [build, chain, cancel, _status_parm("_status" + suffix)]
 
 
 def _with_lock(template):
@@ -592,27 +648,22 @@ def _status_parm(name):
 
 def _erosion_tab(node_kind):
     """Parameters of the project's Gaea node (``node_kind``: "Erosion2",
-    "Erosion" or "SuperColor"), shown in template mode. The parameter names stay
-    the erosion ones (use_template, ero_*) for every kind."""
-    is_erosion = ASSETS[node_kind]["profile"] == "erosion"
-    tab = hou.FolderParmTemplate("erosion_tab", "Erosion" if is_erosion else node_kind,
-                                 folder_type=hou.folderType.Tabs)
-    # Same action and status as on the Bridge tab, so the loop "tweak -> rebuild"
+    "Erosion", "SuperColor" or "Thermal2"), shown in template mode. The
+    parameter names stay the erosion ones (use_template, ero_*) for every kind."""
+    title = "Erosion" if node_kind in EROSION_TAB_KINDS else node_kind
+    tab = hou.FolderParmTemplate("erosion_tab", title, folder_type=hou.folderType.Tabs)
+    # Same actions and status as on the Bridge tab, so the loop "tweak -> rebuild"
     # never leaves this tab.
-    tab.addParmTemplate(_button(
-        "run_cycle_erosion", "Export > Build > Import", CYCLE_CALLBACK,
-        "Same as on the Bridge tab: export, build in Gaea with these values, import."))
+    for template in _action_row("_erosion"):
+        tab.addParmTemplate(template)
     tab.addParmTemplate(hou.ToggleParmTemplate(
         "auto_rebuild", "Auto Build on Change", default_value=False,
-        help="Run Export > Build > Import automatically whenever an Erosion value "
-             "changes (once you stop changing it). While it runs, the whole node is "
-             "locked until the result is imported; Cancel Build unlocks it. Needs "
-             "Use Erosion Template."))
-    tab.addParmTemplate(_button("cancel_build_erosion", "Cancel Build", CANCEL_CALLBACK,
-                                "Stop the running build and unlock the node."))
-    tab.addParmTemplate(_status_parm("_status_erosion"))
+        help="Run Build automatically whenever a {} value changes (once you stop "
+             "changing it). While it runs, the whole node is locked until the result "
+             "is imported; Cancel unlocks it. Needs Use {} Template.".format(
+                 node_kind, title)))
     tab.addParmTemplate(hou.ToggleParmTemplate(
-        "use_template", "Use {} Template".format("Erosion" if is_erosion else node_kind),
+        "use_template", "Use {} Template".format(title),
         default_value=False, script_callback=TEMPLATE_CALLBACK,
         script_callback_language=hou.scriptLanguage.Python,
         help="The Gaea Project is a template whose {0} node feeds the Export "
@@ -622,7 +673,7 @@ def _erosion_tab(node_kind):
     hidden = "{ use_template == 0 }"
 
     node_name = hou.StringParmTemplate(
-        "erosion_node", "{} Node".format("Erosion" if is_erosion else node_kind), 1,
+        "erosion_node", "{} Node".format(title), 1,
         default_value=("",),
         help="Name of the {0} node to drive. Empty = the only {0} in the "
              "project.".format(node_kind))
@@ -688,6 +739,8 @@ def _tint_tab():
     """Build Tint toggle and the tint display button. The Tint settings
     themselves are the Gaea project's own."""
     tab = hou.FolderParmTemplate("tint_tab", "Tint", folder_type=hou.folderType.Tabs)
+    for template in _action_row("_tint"):
+        tab.addParmTemplate(template)
     tab.addParmTemplate(hou.ToggleParmTemplate(
         "build_tint", "Build Tint", default_value=False,
         script_callback=EROSION_CHANGED_CALLBACK,
@@ -706,10 +759,6 @@ def _tint_tab():
     for template in _mesh_display_parms("the Terrain output while the Tint is shown"):
         template.setConditional(hou.parmCondType.DisableWhen, "{ show_tint == 0 }")
         tab.addParmTemplate(template)
-    tab.addParmTemplate(_button(
-        "run_cycle_tint", "Export > Build > Import", CYCLE_CALLBACK,
-        "Same as on the Bridge tab: build in Gaea (erosion and tint) and import."))
-    tab.addParmTemplate(_status_parm("_status_tint"))
     return tab
 
 
@@ -737,12 +786,10 @@ def _mesh_display_parms(what="output 1"):
 def _color_tab():
     """Color profile: the mesh density and the import status."""
     tab = hou.FolderParmTemplate("color_tab", "Color", folder_type=hou.folderType.Tabs)
+    for template in _action_row("_color"):
+        tab.addParmTemplate(template)
     for template in _mesh_display_parms("output 1"):
         tab.addParmTemplate(template)
-    tab.addParmTemplate(_button(
-        "run_cycle_color", "Export > Build > Import", CYCLE_CALLBACK,
-        "Same as on the Bridge tab: export, build the color map in Gaea, import."))
-    tab.addParmTemplate(_status_parm("_status_color"))
     return tab
 
 
@@ -753,11 +800,24 @@ def _build_parm_template_group(node_kind="Erosion2"):
     # --- Bridge tab ---------------------------------------------------- #
     bridge = hou.FolderParmTemplate("bridge_tab", "Bridge",
                                     folder_type=hou.folderType.Tabs)
+    # Main actions first: what is pressed all the time.
+    for template in _action_row(""):
+        bridge.addParmTemplate(template)
+    bridge.addParmTemplate(hou.SeparatorParmTemplate("bridge_sep1"))
+
+    # Resolution: what decides speed vs. detail.
     bridge.addParmTemplate(hou.MenuParmTemplate(
         "downsample", "Export Resolution", ("1", "2", "3", "4"),
         menu_labels=("Full", "1/2", "1/3", "1/4"), default_value=0,
         help="Export resolution relative to the input HeightField. The terrain keeps "
              "its size; only the pixel count drops (1/2 = half the voxels per axis)."))
+    bridge.addParmTemplate(hou.MenuParmTemplate(
+        "build_resolution", "Build Resolution",
+        ("0", "512", "1024", "2048", "4096", "8192", "16384"),
+        menu_labels=("From Project", "512", "1K", "2K", "4K", "8K", "16K"),
+        default_value=0,
+        help="Resolution Gaea builds at (Swarm --resolution). From Project = the "
+             "project's Terrain Definition. Lower = faster previews."))
     mask_layer = hou.StringParmTemplate(
         "mask_input_layer", "Mask Input Layer", 1, default_value=("auto",),
         menu_items=("auto", "mask", "height"),
@@ -769,50 +829,53 @@ def _build_parm_template_group(node_kind="Erosion2"):
              "becomes a mask with Mask by Object. Without a second input the mask "
              "is white everywhere.")
     bridge.addParmTemplate(mask_layer)
-    bridge.addParmTemplate(_button(
-        "run_cycle", "Export > Build > Import", CYCLE_CALLBACK,
-        "Whole round trip without opening Gaea: export the input, build the Gaea "
-        "project with Gaea.Swarm.exe in the background, import the result."))
-    bridge.addParmTemplate(_button("export", "1. Export to Gaea", EXPORT_CALLBACK))
-    bridge.addParmTemplate(_button(
-        "build_gaea", "2. Build in Gaea", BUILD_CALLBACK,
-        "Build the Gaea project with Gaea.Swarm.exe (no Gaea window). With Auto "
-        "Import After Build on, the result is imported when it finishes."))
-    bridge.addParmTemplate(_button("do_import", "3. Import Results", IMPORT_CALLBACK))
-    bridge.addParmTemplate(_button("cancel_build", "Cancel Build", CANCEL_CALLBACK))
-    bridge.addParmTemplate(_button("open_gaea", "Open Project in Gaea", OPEN_CALLBACK))
 
-    build = hou.FolderParmTemplate("build_options", "Gaea Build Options",
-                                   folder_type=hou.folderType.Collapsible)
-    build.addParmTemplate(hou.MenuParmTemplate(
-        "build_resolution", "Build Resolution",
-        ("0", "512", "1024", "2048", "4096", "8192", "16384"),
-        menu_labels=("From Project", "512", "1K", "2K", "4K", "8K", "16K"),
-        default_value=0,
-        help="Resolution Gaea builds at (Swarm --resolution). From Project = the "
-             "project's Terrain Definition."))
-    build.addParmTemplate(hou.ToggleParmTemplate(
-        "ignore_cache", "Ignore Baked Cache", default_value=False,
-        help="Swarm --ignorecache: rebuild nodes Gaea has baked."))
-    build.addParmTemplate(hou.ToggleParmTemplate(
-        "show_console", "Show Build Window", default_value=False,
-        help="Show Swarm's console window during the build (for diagnostics)."))
-    bridge.addParmTemplate(build)
-
-    bridge.addParmTemplate(hou.ToggleParmTemplate(
-        "import_after_build", "Auto Import After Build", default_value=True,
-        help="Import the result as soon as 2. Build in Gaea finishes. Off: build "
-             "only, import later with 3. Import Results. (Export > Build > Import "
-             "always imports.)"))
-    bridge.addParmTemplate(hou.ToggleParmTemplate(
+    # Building in the Gaea window instead of Swarm: rarely needed, folded away.
+    gui = hou.FolderParmTemplate("gui_workflow", "Gaea GUI Workflow",
+                                 folder_type=hou.folderType.Collapsible)
+    export = _button("export", "Export", EXPORT_CALLBACK,
+                     "Write the input (and mask) for Gaea without building.")
+    open_gaea = _button("open_gaea", "Open in Gaea", OPEN_CALLBACK,
+                        "Open the Gaea Project in the Gaea window; build there with "
+                        "F8.")
+    do_import = _button("do_import", "Import", IMPORT_CALLBACK,
+                        "Load the maps Gaea last wrote to the output folder.")
+    export.setJoinWithNext(True)
+    open_gaea.setJoinWithNext(True)
+    for template in (export, open_gaea, do_import):
+        gui.addParmTemplate(template)
+    gui.addParmTemplate(hou.ToggleParmTemplate(
         "auto_import", "Auto Import (Gaea GUI builds)", default_value=False,
         script_callback=AUTO_IMPORT_CALLBACK,
         script_callback_language=hou.scriptLanguage.Python,
         help="Watch the output folder and import automatically when a build made in "
              "the Gaea GUI (F8) writes new files (checked every second; imports once "
              "the files stop changing). Stays on when the scene is reopened."))
-    bridge.addParmTemplate(_button("clear_import", "Clear Import", CLEAR_CALLBACK))
-    bridge.addParmTemplate(_status_parm("_status"))
+    bridge.addParmTemplate(gui)
+
+    advanced = hou.FolderParmTemplate("build_options", "Advanced",
+                                      folder_type=hou.folderType.Collapsible)
+    advanced.addParmTemplate(hou.ToggleParmTemplate(
+        "ignore_cache", "Ignore Gaea Baked Nodes", default_value=False,
+        help="Swarm --ignorecache: also rebuild nodes baked inside the Gaea project."))
+    advanced.addParmTemplate(hou.ToggleParmTemplate(
+        "show_console", "Show Build Window", default_value=False,
+        help="Show Swarm's console window during the build (for diagnostics)."))
+    bridge.addParmTemplate(advanced)
+
+    bridge.addParmTemplate(hou.SeparatorParmTemplate("bridge_sep2"))
+    clear_import = _button(
+        "clear_import", "Clear Import", CLEAR_CALLBACK,
+        "Forget the imported result: the node passes its input through. Files stay "
+        "on disk, so the next Build may come straight from the cache.")
+    clear_import.setJoinWithNext(True)
+    bridge.addParmTemplate(clear_import)
+    bridge.addParmTemplate(_button(
+        "clear_cache", "Clear Cache", CLEAR_CACHE_CALLBACK,
+        "Delete every file this node wrote to its Bridge Dir (exported input and "
+        "mask, build copy of the project, Gaea's outputs, display copies) and clear "
+        "the import. Frees disk space; the next Build starts from scratch. Asks "
+        "first."))
     g.append(bridge)
 
     g.append(_erosion_tab(node_kind))
@@ -820,7 +883,7 @@ def _build_parm_template_group(node_kind="Erosion2"):
         g.append(_color_tab())
     else:
         g.append(_tint_tab())
-        g.append(_layers_tab())
+        g.append(_layers_tab(node_kind))
 
     g.append(_paths_tab(node_kind))
 
@@ -848,10 +911,10 @@ def _build_parm_template_group(node_kind="Erosion2"):
         # Tint display state, set only by Show / Hide Tint.
         g.append(_hidden(hou.ToggleParmTemplate("show_tint", "Tint shown",
                                                 default_value=False)))
-        for layer in ("height",) + MASK_LAYERS:
+        for layer in ("height",) + _mask_layers(node_kind):
             g.append(_hidden(hou.StringParmTemplate(
                 "_{}_file".format(layer), layer + " file", 1, default_value=("",))))
-        for layer in MASK_LAYERS:
+        for layer in _mask_layers(node_kind):
             g.append(_hidden(hou.FloatParmTemplate(
                 "_{}_peak".format(layer), layer + " peak", 1, default_value=(0.0,))))
         for name in ("_enc_span", "_enc_offset"):
@@ -860,7 +923,9 @@ def _build_parm_template_group(node_kind="Erosion2"):
     return hou.ParmTemplateGroup([_with_lock(t) for t in g.entries()])
 
 
-def _layers_tab():
+def _layers_tab(node_kind="Erosion2"):
+    masks = _mask_layers(node_kind)
+    labels = tuple(MASK_INFO[layer][0] for layer in masks)
     layers = hou.FolderParmTemplate("layers_tab", "Gaea Layers",
                                     folder_type=hou.folderType.Tabs)
     layers.addParmTemplate(hou.MenuParmTemplate(
@@ -874,19 +939,16 @@ def _layers_tab():
              "Layer, Replace), so it keeps the input's voxel size and resolution. "
              "Off: outputs keep the resolution Gaea built at."))
     layers.addParmTemplate(hou.MenuParmTemplate(
-        "view_mask", "Show Mask", ("none",) + MASK_LAYERS,
-        menu_labels=("None", "Flow", "Wear", "Sediment"), default_value=0,
+        "view_mask", "Show Mask", ("none",) + masks,
+        menu_labels=("None",) + labels, default_value=0,
         help="Preview on the Terrain output: put this mask into its 'mask' layer so "
              "it shows in red on the terrain. Set back to None before using the "
              "Terrain output downstream, or HeightField nodes will use that mask. "
-             "Each mask always has its own output (Flow, Wear, Sediment)."))
-    layers.addParmTemplate(_mask_folder(
-        "flow", "Flow", "Where water runs: thin channel networks (Erosion2 Flow)."))
-    layers.addParmTemplate(_mask_folder(
-        "wear", "Wear", "Where material was eroded away (Erosion2 Wear)."))
-    layers.addParmTemplate(_mask_folder(
-        "sediment", "Sediment", "Where eroded material was deposited "
-        "(Erosion2 Deposits)."))
+             "Each mask always has its own output ({}).".format(", ".join(labels))))
+    for layer in masks:
+        label, gaea_port, what = MASK_INFO[layer]
+        layers.addParmTemplate(_mask_folder(
+            layer, label, "{} ({} {}).".format(what.rstrip("."), node_kind, gaea_port)))
     return layers
 
 
@@ -926,13 +988,17 @@ def _paths_tab(node_kind):
         "Show the paths this node will use (shared ones and the auto-found "
         "project), and which are missing."))
     paths.addParmTemplate(_status_parm("_status_paths"))
-    paths.addParmTemplate(hou.FloatParmTemplate(
+    # Read from the project; only for projects whose size can't be read.
+    world = hou.FolderParmTemplate("world_override", "World Size Override",
+                                   folder_type=hou.folderType.Collapsible)
+    world.addParmTemplate(hou.FloatParmTemplate(
         "gaea_width", "Gaea Width (m)", 1, default_value=(0.0,), min=0.0, max=20000.0,
         help="Gaea Terrain Definition > Scale. 0 = read from the .terrain project."))
-    paths.addParmTemplate(hou.FloatParmTemplate(
+    world.addParmTemplate(hou.FloatParmTemplate(
         "gaea_height", "Gaea Height (m)", 1, default_value=(0.0,), min=0.0,
         max=10000.0,
         help="Gaea Terrain Definition > Height. 0 = read from the .terrain project."))
+    paths.addParmTemplate(world)
     return paths
 
 
@@ -969,7 +1035,7 @@ def build(install_dir=None, node_kind="Erosion2"):
         if color:
             _build_color_network(subnet)
         else:
-            _build_network(subnet)
+            _build_network(subnet, _mask_layers(node_kind))
 
         if install_dir is None:
             install_dir = os.path.join(
@@ -993,7 +1059,7 @@ def build(install_dir=None, node_kind="Erosion2"):
             outputs = ("Colored Mesh", "HeightField + color_r/g/b")
         else:
             inputs = ("HeightField", "Mask (optional)")
-            outputs = ("Terrain",) + tuple(l.capitalize() for l in MASK_LAYERS)
+            outputs = ("Terrain",) + tuple(MASK_INFO[l][0] for l in _mask_layers(node_kind))
         definition.setMaxNumOutputs(len(outputs))
         _set_io_labels(definition, inputs=inputs, outputs=outputs)
         scripts = [("OnLoaded", ON_LOADED_SCRIPT), ("OnDeleted", ON_DELETED_SCRIPT)]
@@ -1019,8 +1085,8 @@ def build(install_dir=None, node_kind="Erosion2"):
 
 
 def build_all(install_dir=None):
-    """Install every bridge: Gaea Erosion2 Bridge, Gaea Erosion Bridge and Gaea
-    SuperColor Bridge."""
+    """Install every bridge: Gaea Erosion2 Bridge, Gaea Erosion Bridge, Gaea
+    SuperColor Bridge and Gaea Thermal2 Bridge."""
     return [build(install_dir, node_kind) for node_kind in ASSETS]
 
 
