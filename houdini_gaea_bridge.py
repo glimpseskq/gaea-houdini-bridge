@@ -1589,17 +1589,87 @@ def heightfield_info(source_node):
     )
 
 
-def _configure_height_channels(export_node, encoding, layer="height"):
-    """Write ``layer`` as grayscale RGB, encoded for Gaea's world scale.
+# --------------------------------------------------------------------------- #
+# Input EXRs for Gaea: one channel, written once
+# --------------------------------------------------------------------------- #
+
+# heightfield_output writes three identical channels in "rgb"; "single" writes one
+# (2.5x faster at 4K) but names it "A.A", which Gaea's File node ignores (a flat
+# terrain). So the single file gets its channel renamed to "R" with Houdini's own
+# oiiotool, after which Gaea's result is byte-identical to the RGB input's. When
+# "single" or hoiiotool is missing, the RGB export is used as before.
+HEIGHT_EXR_TYPE = "fp32"   # heights stay full float: half would terrace tall relief
+MASK_EXR_TYPE = "fp16"     # a 0..1 mask: half float, ~5x smaller file
+OIIOTOOL_NAMES = ("hoiiotool.exe", "hoiiotool", "oiiotool.exe", "oiiotool")
+# Part of the reuse key of written inputs: a new layout rewrites them once.
+EXPORT_LAYOUT = "single-R/1"
+_VERIFIED_EXPORTS = set()   # (format, type) checked by reading back this session
+
+
+def oiiotool_path():
+    """Houdini's oiiotool ($HFS/bin/hoiiotool), or None."""
+    try:
+        import hou
+        folder = hou.text.expandString("$HFS/bin")
+    except Exception:  # outside Houdini
+        return None
+    for name in OIIOTOOL_NAMES:
+        path = os.path.join(folder, name)
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def _rename_channel_to_r(tool, source, target):
+    """Rewrite single-channel ``source`` as ``target`` with the channel named R.
+    True on success (``target`` exists, non-empty)."""
+    kwargs = {"capture_output": True}
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        result = subprocess.run([tool, source, "--chnames", "R", "--compression", "zip",
+                                 "-o", target], **kwargs)
+    except OSError:
+        return False
+    return result.returncode == 0 and os.path.isfile(target) and \
+        os.path.getsize(target) > 0
+
+
+def input_keys(height_hash, encoding, image_size, mask_hash):
+    """What each input EXR is written from: same key = same file, so an export
+    whose height (or mask) didn't change skips writing it again."""
+    def key(*parts):
+        return hashlib.sha1(_normalise_dict({"parts": list(parts)}).encode(
+            "utf-8")).hexdigest()
+    size = [int(image_size[0]), int(image_size[1])]
+    return {"height": key(EXPORT_LAYOUT, HEIGHT_EXR_TYPE, height_hash, encoding, size),
+            "mask": key(EXPORT_LAYOUT, MASK_EXR_TYPE, mask_hash, size)}
+
+
+def reusable_inputs(manifest, keys, paths):
+    """Names in ``keys`` ("height", "mask") whose file from the last export can
+    be kept: the manifest recorded the same key and the file is still there."""
+    recorded = (manifest or {}).get("input_keys") or {}
+    return {name for name, value in keys.items()
+            if recorded.get(name) == value and os.path.isfile(paths[name])
+            and os.path.getsize(paths[name]) > 0}
+
+
+def _configure_height_channels(export_node, encoding, layer="height", single=False):
+    """Write ``layer`` as grayscale RGB (or one channel with ``single``), encoded
+    for Gaea's world scale. Returns the format set ("rgb" or "single").
 
     heightfield_output leaves the channel layers empty by default and fills them with
     a constant 1.0 (a flat terrain in Gaea), so the layer is set explicitly. Heights
     are remapped from ``offset..offset+span`` to 0..1 (see ``height_encoding``).
+    "single" takes the red channel's settings.
     """
     format_parm = _find_parm(export_node, HFOUT_FORMAT_PARMS)
     if format_parm is None:
         raise _missing_parm_error(export_node, "image Format", HFOUT_FORMAT_PARMS)
-    format_parm.set("rgb")
+    chosen = "single" if single and "single" in format_parm.parmTemplate().menuItems() \
+        else "rgb"
+    format_parm.set(chosen)
     low = encoding["offset"]
     high = encoding["offset"] + encoding["span"]
     for channel in ("red", "green", "blue"):
@@ -1618,6 +1688,7 @@ def _configure_height_channels(export_node, encoding, layer="height"):
         parms["range"].set("manual")
         parms["from"].set((low, high))
         parms["to"].set((0.0, 1.0))
+    return chosen
 
 
 def _set_export_resolution(export_node, image_size):
@@ -1678,26 +1749,42 @@ def _verify_export(parent, path, encoding, flat):
 
 
 def _export_heightfield(source_node, input_path, encoding, image_size,
-                        layer="height", verify=True):
+                        layer="height", verify=True, data_type="fp32",
+                        allow_single=True):
     """Write the source's ``layer`` to ``input_path`` using ``encoding``.
 
     ``image_size`` is ``(x, y)`` in pixels; heightfield_output resamples the layer
     to it, so the exported terrain keeps its world size at a lower resolution.
+    One channel named R (see EXPORT_LAYOUT) when possible, else RGB float.
+    ``verify`` reads the file back, once per session for each format and type.
+    Returns ``(format, type)`` written.
     """
     parent = source_node.parent()
     os.makedirs(os.path.dirname(input_path), exist_ok=True)
+    tool = oiiotool_path() if allow_single else None
+    single_path = input_path + ".single.exr"
 
     export_node = _create_node_from_candidates(
         parent, HEIGHTFIELD_OUTPUT_NODE_TYPES, "gaea_bridge_export"
     )
     try:
         export_node.setInput(0, source_node)
-        _configure_height_channels(export_node, encoding, layer=layer)
+        image_format = _configure_height_channels(export_node, encoding, layer=layer,
+                                                  single=tool is not None)
+        if image_format == "single":
+            type_parm = export_node.parm("output_type")
+            if type_parm is not None and data_type in type_parm.parmTemplate().menuItems():
+                type_parm.set(data_type)
+            else:
+                data_type = "fp32"
+        else:
+            data_type = "fp32"  # the RGB layout as it always was
         _set_export_resolution(export_node, image_size)
+        target = single_path if image_format == "single" else input_path
         file_parm_name = None
         for name in OUTPUT_FILE_PARM_CANDIDATES:
             if export_node.parm(name) is not None:
-                export_node.parm(name).set(input_path)
+                export_node.parm(name).set(target)
                 file_parm_name = name
                 break
         if file_parm_name is None:
@@ -1710,7 +1797,7 @@ def _export_heightfield(source_node, input_path, encoding, image_size,
                         export_node.path()
                     )
                 )
-            label_parm.set(input_path)
+            label_parm.set(target)
 
         _press_first_available(
             export_node,
@@ -1720,13 +1807,28 @@ def _export_heightfield(source_node, input_path, encoding, image_size,
     finally:
         export_node.destroy()
 
+    if image_format == "single":
+        renamed = os.path.isfile(single_path) and _rename_channel_to_r(
+            tool, single_path, input_path)
+        try:
+            os.remove(single_path)
+        except OSError:
+            pass
+        if not renamed:  # oiiotool failed: write the RGB layout instead
+            return _export_heightfield(source_node, input_path, encoding, image_size,
+                                       layer=layer, verify=verify, allow_single=False)
+
     if not os.path.isfile(input_path):
         raise RuntimeError("Houdini did not create the input EXR: {}".format(input_path))
     if os.path.getsize(input_path) == 0:
         raise RuntimeError("Houdini created an empty input EXR: {}".format(input_path))
-    if verify:
-        _verify_export(parent, input_path, encoding,
-                       flat=encoding["max_value"] < 1e-9)
+    flat = encoding["max_value"] < 1e-9
+    key = (image_format, data_type, houdini_version_string())
+    if verify and key not in _VERIFIED_EXPORTS:
+        _verify_export(parent, input_path, encoding, flat=flat)
+        if not flat:  # a flat terrain proves nothing about the layout
+            _VERIFIED_EXPORTS.add(key)
+    return image_format, data_type
 
 
 def _volume_ranges(geometry):
@@ -1844,8 +1946,14 @@ class MaskNetwork:
 
     def coverage(self):
         """Mean mask value (0..1): how much of the terrain is masked in."""
-        values = self.mask_prim().allVoxels()
-        return sum(values) / float(len(values) or 1)
+        prim = self.mask_prim()
+        try:
+            import numpy
+            values = numpy.frombuffer(prim.allVoxelsAsString(), dtype=numpy.float32)
+            return float(values.mean()) if values.size else 0.0
+        except ImportError:  # Houdini ships numpy; plain Python as a fallback
+            values = prim.allVoxels()
+            return sum(values) / float(len(values) or 1)
 
     def __enter__(self):
         return self.build()
@@ -1991,9 +2099,10 @@ def _export_with_mask(source_node, config, use_cache, mask):
         info["resolution"][0], info["resolution"][1], config.downsample
     )
     # Heights + how they're encoded for Gaea + how Gaea will build them.
+    mask_hash = mask.content_hash()
     content_hash = hashlib.sha1((
         info["content_hash"] + _normalise_dict(encoding)
-        + _normalise_dict(build_settings(config)) + mask.content_hash()
+        + _normalise_dict(build_settings(config)) + mask_hash
     ).encode("utf-8")).hexdigest()
     signature = compute_signature(
         config.input_path, config.downsample, config.output_maps, content_hash
@@ -2010,13 +2119,27 @@ def _export_with_mask(source_node, config, use_cache, mask):
             "outputs already exist. No rebuild needed.",
         }
 
-    _export_heightfield(source_node, config.input_path, encoding, image_size)
-    coverage = mask.coverage()
-    _export_heightfield(mask.output, config.mask_input_path,
-                        {"offset": 0.0, "span": 1.0, "max_value": 1.0}, image_size,
-                        layer="mask", verify=False)
+    # Only Gaea settings changed (the usual case while tuning a node): the input
+    # EXRs on disk already hold these heights and this mask, so they are kept.
+    previous = read_manifest(config) or {}
+    keys = input_keys(info["content_hash"], encoding, image_size, mask_hash)
+    reuse = reusable_inputs(previous, keys, {"height": config.input_path,
+                                             "mask": config.mask_input_path})
+    if "height" not in reuse:
+        _export_heightfield(source_node, config.input_path, encoding, image_size,
+                            data_type=HEIGHT_EXR_TYPE)
+    previous_mask = previous.get("mask") or {}
+    if "mask" in reuse and "coverage" in previous_mask:
+        coverage = float(previous_mask["coverage"])
+    else:
+        coverage = mask.coverage()
+    if "mask" not in reuse:
+        _export_heightfield(mask.output, config.mask_input_path,
+                            {"offset": 0.0, "span": 1.0, "max_value": 1.0}, image_size,
+                            layer="mask", verify=False, data_type=MASK_EXR_TYPE)
     mask_info = dict(mask.info, file=config.mask_input_name, coverage=coverage)
     write_manifest(config, signature, extra={
+        "input_keys": keys,
         "mask": mask_info,
         "height_range": [info["min"], info["max"]],
         "houdini_width": info["width"],
@@ -2027,9 +2150,13 @@ def _export_with_mask(source_node, config, use_cache, mask):
         "height_encoding": encoding,
     })
 
-    notes = ["Mask: {} ({:.0%} of the terrain).".format(
+    notes = []
+    if reuse:
+        notes.append("Unchanged, not rewritten: {}.".format(" and ".join(
+            "input" if name == "height" else name for name in sorted(reuse))))
+    notes.append("Mask: {} ({:.0%} of the terrain).".format(
         mask_info.get("layer") and "layer '{}'".format(mask_info["layer"])
-        or mask_info["source"], coverage)]
+        or mask_info["source"], coverage))
     if mask.mask_input is not None and coverage < 1e-4:
         notes.append("WARNING: the mask is empty here; Gaea won't change anything. "
                      "Check that it overlaps the terrain.")

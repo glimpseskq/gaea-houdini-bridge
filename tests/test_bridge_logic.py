@@ -578,7 +578,12 @@ class Thermal2Tests(unittest.TestCase):
         # The build copy points the File and all three Exports at the bridge.
         copy = ghb.template_build_path(cfg)
         changed = ghb.write_template_copy(cfg, copy)
-        self.assertEqual(changed, ["Angle", "input file", "export paths"])
+        self.assertEqual(changed[:2], ["Angle", "input file"])
+        self.assertEqual(changed[-1], "export paths")
+        # A File node on AreaMask (if the project has one) reads the mask input.
+        with open(copy, encoding="utf-8") as handle:
+            for node in ghb.mask_file_nodes(json.load(handle)):
+                self.assertTrue(ghb._same_path(node["FileName"], cfg.mask_input_path))
         cfg.gaea_project = copy
         self.assertEqual(ghb.check_project_paths(cfg), [])
 
@@ -1230,6 +1235,52 @@ class CleanupTests(unittest.TestCase):
     def test_is_within_helper(self):
         self.assertTrue(ghb._is_within(os.path.join(self.tmp, "a", "b"), self.tmp))
         self.assertFalse(ghb._is_within(os.path.dirname(self.tmp), self.tmp))
+
+
+class InputReuseTests(unittest.TestCase):
+    """Export skips rewriting an input EXR whose source didn't change."""
+
+    ENC = {"offset": -10.0, "span": 200.0, "max_value": 0.08}
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.paths = {"height": os.path.join(self.tmp, "input_height.exr"),
+                      "mask": os.path.join(self.tmp, "input_mask.exr")}
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_keys_follow_what_each_file_is_written_from(self):
+        base = ghb.input_keys("h1", self.ENC, (2048, 2048), "m1")
+        self.assertEqual(base, ghb.input_keys("h1", dict(self.ENC), [2048, 2048], "m1"))
+        other_height = ghb.input_keys("h2", self.ENC, (2048, 2048), "m1")
+        self.assertNotEqual(base["height"], other_height["height"])
+        self.assertEqual(base["mask"], other_height["mask"])  # mask unaffected
+        other_mask = ghb.input_keys("h1", self.ENC, (2048, 2048), "m2")
+        self.assertEqual(base["height"], other_mask["height"])
+        self.assertNotEqual(base["mask"], other_mask["mask"])
+        rescaled = ghb.input_keys("h1", dict(self.ENC, span=300.0), (2048, 2048), "m1")
+        self.assertNotEqual(base["height"], rescaled["height"])  # encoding counts
+        smaller = ghb.input_keys("h1", self.ENC, (1024, 1024), "m1")
+        self.assertNotEqual(base["height"], smaller["height"])
+        self.assertNotEqual(base["mask"], smaller["mask"])
+
+    def test_reuse_needs_same_key_and_the_file(self):
+        keys = ghb.input_keys("h1", self.ENC, (512, 512), "m1")
+        manifest = {"input_keys": dict(keys)}
+        self.assertEqual(ghb.reusable_inputs(manifest, keys, self.paths), set())
+        _write(self.paths["height"])
+        _write(self.paths["mask"])
+        self.assertEqual(ghb.reusable_inputs(manifest, keys, self.paths),
+                         {"height", "mask"})
+        changed = ghb.input_keys("h2", self.ENC, (512, 512), "m1")
+        self.assertEqual(ghb.reusable_inputs(manifest, changed, self.paths), {"mask"})
+        # no manifest (first export, Clear Cache) or one from an older bridge
+        self.assertEqual(ghb.reusable_inputs(None, keys, self.paths), set())
+        self.assertEqual(ghb.reusable_inputs({"signature": "x"}, keys, self.paths), set())
+        _write(self.paths["mask"], b"")  # an empty file is never kept
+        self.assertEqual(ghb.reusable_inputs(manifest, keys, self.paths), {"height"})
 
 
 class ClearCacheTests(unittest.TestCase):
